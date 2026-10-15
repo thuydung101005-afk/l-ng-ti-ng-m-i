@@ -38,7 +38,14 @@ export function useDubbingEngine() {
       .then((r) => r.json())
       .then((data) => {
         if (data?.keys) {
-          setGeminiApiKeysStr((prev) => (prev && prev.trim().length > 0 ? prev : data.keys));
+          setGeminiApiKeysStr((prev) => {
+            if (!prev || !prev.trim()) return data.keys;
+            const currentKeys = prev.split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean);
+            const envKeys = (data.keys as string).split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean);
+            // Đưa các key từ .env lên đầu nếu chưa có
+            const combined = Array.from(new Set([...envKeys, ...currentKeys]));
+            return combined.join('\n');
+          });
         }
       })
       .catch(() => {});
@@ -627,7 +634,7 @@ if (activeProvider === 'omnivoice') {
             const errData = await res.json().catch(() => ({}));
             const msg = String(errData.error || "");
             if (msg.includes("401") || msg.includes("UNAUTHENTICATED") || msg.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED")) {
-                throw new Error("Key AI không hợp lệ hoặc bị Google từ chối (401)! Lưu ý: Key Gemini bắt buộc phải có dạng 'AIzaSy...', DeepSeek bắt đầu bằng 'sk-...'. Key hiện tại của bạn không phải key Gemini hợp lệ.");
+                throw new Error("Tất cả các API key đã thử đều bị Google từ chối (401 / hết hạn / chưa kích hoạt). Vui lòng dán key mới nhất vào ô 'API Key AI Rút gọn' trên giao diện!");
             }
             throw new Error(errData.error || `Lỗi gọi Gemini (HTTP ${res.status})`);
         }

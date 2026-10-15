@@ -142,7 +142,7 @@ async function startServer() {
         : [];
         
       const envKeys = getGeminiKeysFromDisk();
-      const apiKeys = clientKeys.length > 0 ? clientKeys : envKeys;
+      const apiKeys = Array.from(new Set([...clientKeys, ...envKeys]));
 
       if (apiKeys.length === 0) {
         return res.status(500).json({ error: "Thieu biến môi trường GEMINI_API_KEY hoặc GEMINI_API_KEYS ở server và không có key dự phòng" });
@@ -257,7 +257,7 @@ async function startServer() {
         : [];
         
       const envKeys = getGeminiKeysFromDisk();
-      const apiKeys = (clientKeys.length > 0 ? clientKeys : envKeys) as string[];
+      const apiKeys = Array.from(new Set([...clientKeys, ...envKeys])) as string[];
 
       if (apiKeys.length === 0) {
         return res.status(500).json({ error: "Thieu biến môi trường GEMINI_API_KEY hoặc GEMINI_API_KEYS ở server và không có key dự phòng" });
