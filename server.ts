@@ -113,10 +113,24 @@ async function startServer() {
     }
   });
 
+  function getGeminiKeysFromDisk(): string[] {
+    let raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "";
+    try {
+      const envPath = path.resolve(process.cwd(), '.env');
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        const match = envContent.match(/GEMINI_API_KEYS\s*=\s*"([^"]+)"/s) || envContent.match(/^GEMINI_API_KEYS\s*=\s*(.+)$/m) || envContent.match(/^GEMINI_API_KEY\s*=\s*(.+)$/m);
+        if (match && match[1]?.trim()) {
+          raw = match[1].trim();
+        }
+      }
+    } catch (e) {}
+    return raw.replace(/\\n/g, '\n').split(/[\n,]+/).map((k) => k.trim()).filter(Boolean);
+  }
+
   app.get("/api/gemini/default-keys", (req, res) => {
-    const raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "";
-    const formatted = raw.replace(/\\n/g, '\n');
-    res.json({ keys: formatted });
+    const keys = getGeminiKeysFromDisk();
+    res.json({ keys: keys.join('\n') });
   });
 
   app.post("/api/gemini/rewrite-batch", async (req, res) => {
@@ -127,9 +141,7 @@ async function startServer() {
         ? clientGeminiKeysStr.split(/[\n,]+/).map((k) => k.trim()).filter(Boolean)
         : [];
         
-      const envKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
-        .replace(/\\n/g, '\n')
-        .split(/[\n,]+/).map((k) => k.trim()).filter(Boolean);
+      const envKeys = getGeminiKeysFromDisk();
       const apiKeys = clientKeys.length > 0 ? clientKeys : envKeys;
 
       if (apiKeys.length === 0) {
@@ -149,62 +161,67 @@ async function startServer() {
       
       let resultText = "";
       let lastError;
-      let keyIndex = globalGeminiKeyIndex++;
-      
-      const geminiModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+      const geminiModels = ["gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-2.5-flash"];
       let success = false;
-      let maxRetries = 15;
-      
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          const currentKey = apiKeys[keyIndex % apiKeys.length];
+      const startKeyIndex = globalGeminiKeyIndex % apiKeys.length;
+
+      // Vòng lặp duyệt qua từng key
+      for (let k = 0; k < apiKeys.length; k++) {
+          const currentKeyIdx = (startKeyIndex + k) % apiKeys.length;
+          const currentKey = apiKeys[currentKeyIdx];
           const isGrok = currentKey.startsWith("xai-");
           const isDeepSeek = currentKey.startsWith("sk-");
-          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-chat" : geminiModels[(attempt - 1) % geminiModels.length]);
-          
-          try {
-              if (isGrok || isDeepSeek) {
-                  const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
-                  const res = await fetch(apiUrl, {
-                      method: "POST",
-                      headers: {
-                          "Content-Type": "application/json",
-                          "Authorization": "Bearer " + currentKey
-                      },
-                      body: JSON.stringify({
-                          messages: [{ role: "user", content: prompt }],
+          const modelsToTry = isGrok ? ["grok-2-latest"] : (isDeepSeek ? ["deepseek-chat"] : geminiModels);
+
+          // Vòng lặp duyệt qua từng model của key đó
+          for (const model of modelsToTry) {
+              try {
+                  console.log(`[AI Rewrite Batch] Thử key ${currentKeyIdx + 1}/${apiKeys.length} (${currentKey.substring(0, 10)}...) với model: ${model}`);
+                  if (isGrok || isDeepSeek) {
+                      const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
+                      const res = await fetch(apiUrl, {
+                          method: "POST",
+                          headers: {
+                              "Content-Type": "application/json",
+                              "Authorization": "Bearer " + currentKey
+                          },
+                          body: JSON.stringify({
+                              messages: [{ role: "user", content: prompt }],
+                              model: model,
+                              temperature: 0.2
+                          })
+                      });
+                      if (!res.ok) throw new Error("HTTP " + res.status + ": " + await res.text());
+                      const data = await res.json();
+                      resultText = data.choices[0].message.content.trim();
+                      success = true;
+                      globalGeminiKeyIndex = currentKeyIdx;
+                      break;
+                  } else {
+                      const ai = new GoogleGenAI({ apiKey: currentKey });
+                      const geminiResponse = await ai.models.generateContent({
                           model: model,
-                          temperature: 0.2
-                      })
-                  });
-                  if (!res.ok) throw new Error("HTTP " + res.status + ": " + await res.text());
-                  const data = await res.json();
-                  resultText = data.choices[0].message.content.trim();
-                  success = true;
-                  break;
-              } else {
-                  const ai = new GoogleGenAI({ apiKey: currentKey });
-                  const geminiResponse = await ai.models.generateContent({
-                      model: model,
-                      contents: prompt,
-                      config: {
-                          responseMimeType: "application/json"
-                      }
-                  });
-                  resultText = geminiResponse.text?.trim() || "";
-                  success = true;
-                  break;
+                          contents: prompt,
+                          config: {
+                              responseMimeType: "application/json"
+                          }
+                      });
+                      resultText = geminiResponse.text?.trim() || "";
+                      success = true;
+                      globalGeminiKeyIndex = currentKeyIdx;
+                      break;
+                  }
+              } catch (error: any) {
+                  lastError = error;
+                  const errMsg = String(error?.message || error);
+                  console.warn(`[AI Rewrite Batch] Key ${currentKeyIdx + 1} model ${model} lỗi:`, errMsg.substring(0, 150));
+                  if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+                      await new Promise(r => setTimeout(r, 500));
+                      break; // Quota hết thì đổi key luôn
+                  }
               }
-          } catch (error: any) {
-              lastError = error;
-              const errMsg = String(error?.message || error);
-              console.warn(`[AI Rewrite Batch] Attempt ${attempt} failed with ${model}:`, errMsg);
-              if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-                  keyIndex++; globalGeminiKeyIndex = keyIndex; await new Promise(r => setTimeout(r, 1000)); continue;
-              } else if (errMsg.includes("503") || errMsg.includes("High demand")) {
-                  await new Promise(r => setTimeout(r, 2000)); continue;
-              }
-              keyIndex++; globalGeminiKeyIndex = keyIndex; continue;
           }
+          if (success) break;
       }
       
       if (!success) throw lastError || new Error("Failed to generate content");
@@ -239,9 +256,7 @@ async function startServer() {
         ? clientGeminiKeysStr.split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean)
         : [];
         
-      const envKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
-        .replace(/\\n/g, '\n')
-        .split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean);
+      const envKeys = getGeminiKeysFromDisk();
       const apiKeys = (clientKeys.length > 0 ? clientKeys : envKeys) as string[];
 
       if (apiKeys.length === 0) {
@@ -274,77 +289,74 @@ Câu gốc cần rút gọn:
 
       let resultText = "";
       let lastError;
-      let keyIndex = globalGeminiKeyIndex++;
-      
       const geminiModels = [
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash"
+        "gemini-flash-latest",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash"
       ];
       
       let success = false;
-      let maxRetries = 15;
+      const startKeyIndex = globalGeminiKeyIndex % apiKeys.length;
       
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          const currentKey = apiKeys[keyIndex % apiKeys.length];
+      // Vòng lặp duyệt qua từng key
+      for (let k = 0; k < apiKeys.length; k++) {
+          const currentKeyIdx = (startKeyIndex + k) % apiKeys.length;
+          const currentKey = apiKeys[currentKeyIdx];
           const isGrok = currentKey.startsWith("xai-");
           const isDeepSeek = currentKey.startsWith("sk-");
-          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-chat" : geminiModels[(attempt - 1) % geminiModels.length]);
+          const modelsToTry = isGrok ? ["grok-2-latest"] : (isDeepSeek ? ["deepseek-chat"] : geminiModels);
           
-          try {
-              if (isGrok || isDeepSeek) {
-                  const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
-                  const res = await fetch(apiUrl, {
-                      method: "POST",
-                      headers: {
-                          "Content-Type": "application/json",
-                          "Authorization": `Bearer ${currentKey}`
-                      },
-                      body: JSON.stringify({
-                          messages: [
-                              { role: "user", content: prompt }
-                          ],
+          // Vòng lặp duyệt qua từng model của key đó
+          for (const model of modelsToTry) {
+              try {
+                  console.log(`[AI Rewrite] Thử key ${currentKeyIdx + 1}/${apiKeys.length} (${currentKey.substring(0, 10)}...) với model: ${model}`);
+                  if (isGrok || isDeepSeek) {
+                      const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
+                      const res = await fetch(apiUrl, {
+                          method: "POST",
+                          headers: {
+                              "Content-Type": "application/json",
+                              "Authorization": `Bearer ${currentKey}`
+                          },
+                          body: JSON.stringify({
+                              messages: [
+                                  { role: "user", content: prompt }
+                              ],
+                              model: model,
+                              temperature: 0.3
+                          })
+                      });
+                      if (!res.ok) {
+                          const errData = await res.text();
+                          throw new Error(`HTTP ${res.status}: ${errData}`);
+                      }
+                      const data = await res.json();
+                      resultText = data.choices[0].message.content.trim();
+                      success = true;
+                      globalGeminiKeyIndex = currentKeyIdx;
+                      break;
+                  } else {
+                      const ai = new GoogleGenAI({ apiKey: currentKey });
+                      const geminiResponse = await ai.models.generateContent({
                           model: model,
-                          temperature: 0.3
-                      })
-                  });
-                  if (!res.ok) {
-                      const errData = await res.text();
-                      throw new Error(`HTTP ${res.status}: ${errData}`);
+                          contents: prompt,
+                      });
+                      resultText = geminiResponse.text?.trim() || "";
+                      success = true;
+                      globalGeminiKeyIndex = currentKeyIdx;
+                      break;
                   }
-                  const data = await res.json();
-                  resultText = data.choices[0].message.content.trim();
-                  success = true;
-                  break;
-              } else {
-                  const ai = new GoogleGenAI({ apiKey: currentKey });
-                  const geminiResponse = await ai.models.generateContent({
-                      model: model,
-                      contents: prompt,
-                  });
-                  resultText = geminiResponse.text?.trim() || "";
-                  success = true;
-                  break;
+              } catch (error: any) {
+                  lastError = error;
+                  const errMsg = String(error.message || error);
+                  console.warn(`[AI Rewrite] Key ${currentKeyIdx + 1} model ${model} lỗi:`, errMsg.substring(0, 150));
+                  if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+                      await new Promise(resolve => setTimeout(resolve, 500));
+                      break; // Hết quota thì chuyển key tiếp theo
+                  }
               }
-          } catch (error: any) {
-              lastError = error;
-              const errMsg = String(error.message || error);
-              if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
-                  console.warn(`[AI Rewrite] Attempt ${attempt} failed for ${model} (429 Quota). Switching key...`);
-                  keyIndex++;
-                  globalGeminiKeyIndex = keyIndex;
-                  await new Promise(resolve => setTimeout(resolve, 1000));
-                  continue;
-              } else if (errMsg.includes("503") || errMsg.includes("High demand")) {
-                  console.warn(`[AI Rewrite] Attempt ${attempt} failed for ${model} (503). Retrying...`);
-                  await new Promise(resolve => setTimeout(resolve, 2000));
-                  continue;
-              }
-              console.warn(`[AI Rewrite] Model ${model} failed:`, errMsg);
-              keyIndex++;
-              globalGeminiKeyIndex = keyIndex;
-              continue;
           }
+          if (success) break;
       }
       if (!success) {
         throw lastError || new Error("Failed to generate content after multiple attempts");
