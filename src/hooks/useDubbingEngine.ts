@@ -84,18 +84,18 @@ export function useDubbingEngine() {
   const [aivoicesList, setAivoicesList] = useState<{ voice_id: string; name: string; gender: string; region: string }[]>([]);
   const reviewResolverRef = useRef<((editedItems: any[]) => void) | null>(null);
 
-  const RENDER_SPEED = 1.4;
-const NORMAL_SPEED = 1.55;
-const MID_RENDER_SPEED = 1.65;
-const MID_CAP_SPEED = 1.8;
-const STRETCH_PRESETS: [number, number][] = [
-  [1.4, 1.55],
-  [1.45, 1.6],
-  [1.5, 1.65],
-  [1.55, 1.7],
-  [1.6, 1.75],
-  [1.65, 1.8]
-];
+  const RENDER_SPEED = minAutoFitSpeed;
+  const NORMAL_SPEED = minAutoFitSpeed;
+  const MID_RENDER_SPEED = Number(((minAutoFitSpeed + maxAutoFitSpeed) / 2).toFixed(2));
+  const MID_CAP_SPEED = maxAutoFitSpeed;
+  const speedStep = Math.max(0.01, (maxAutoFitSpeed - minAutoFitSpeed) / 5);
+  const STRETCH_PRESETS: [number, number][] = [
+    [minAutoFitSpeed, Number((minAutoFitSpeed + speedStep * 1).toFixed(2))],
+    [Number((minAutoFitSpeed + speedStep * 0.5).toFixed(2)), Number((minAutoFitSpeed + speedStep * 2).toFixed(2))],
+    [Number((minAutoFitSpeed + speedStep * 1).toFixed(2)), Number((minAutoFitSpeed + speedStep * 3).toFixed(2))],
+    [Number((minAutoFitSpeed + speedStep * 1.5).toFixed(2)), Number((minAutoFitSpeed + speedStep * 4).toFixed(2))],
+    [Number((minAutoFitSpeed + speedStep * 2).toFixed(2)), maxAutoFitSpeed]
+  ];
 
     const ttsCache = useRef(new Map<string, ArrayBuffer>());
   const jobKeyRef = useRef<Map<string, string>>(new Map());
@@ -524,7 +524,7 @@ const STRETCH_PRESETS: [number, number][] = [
           setResultSrtUrl(null);
                 if (reportListRef.current.length > 0) {
         addLog(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, 'warning');
-        addLog(`⚠️ ${reportListRef.current.length} câu chạm trần 2.1x, cần kiểm tra lại:`, 'warning');
+        addLog(`⚠️ ${reportListRef.current.length} câu chạm trần ${maxAutoFitSpeed}x, cần kiểm tra lại:`, 'warning');
         reportListRef.current.forEach(p => {
             addLog(`  • Câu ${p.index} — dư ${p.overflow.toFixed(2)}s (gap ${p.gap.toFixed(2)}s): "${p.text}"`, 'warning');
         });
@@ -1058,40 +1058,28 @@ if (activeProvider === 'omnivoice') {
               const effectiveDuration = targetDuration + borrowedGap;
 
               if (!aiRewrite) {
-                  // --- EXACT NEW LOGIC FOR AI OFF ---
-                  // Bước 1: Render thử mặc định 1.4x
-                  let renderSpeed1 = 1.4;
+                  // --- SỬ DỤNG TRỰC TIẾP minAutoFitSpeed VÀ maxAutoFitSpeed TỪ GIAO DIỆN ---
+                  // Bước 1: Render thử ở minAutoFitSpeed (chuẩn giao diện)
+                  let renderSpeed1 = minAutoFitSpeed;
                   let exportIdRef1: { current: string | null } = { current: null };
                   let buffer1 = await runTTS(cleanText, renderSpeed1, i, exportIdRef1, forceRefetch, activeProvider, activeVoiceId);
                   forceRefetch = false;
                   let decoded1 = await audioCtx.decodeAudioData(buffer1.slice(0));
                   let rawDuration = decoded1.duration;
-                  
-                  // DÙNG HÀM TĂNG TỐC lần 1
-                  let stretched1 = await applyTimeStretch(decoded1, 1.55 / 1.4);
 
                   // Bước 2: Tính tốc độ cần thiết (có tính gap mượn)
-                  let neededSpeed = (rawDuration * 1.4) / effectiveDuration;
+                  let neededSpeed = (rawDuration * renderSpeed1) / effectiveDuration;
                   let finalBuffer: ArrayBuffer;
 
-                  // Bước 3: Phân nhánh
-                  if (neededSpeed <= 1.55) {
-                      // Nhánh A
-                      finalBuffer = stretched1;
-                      addLog(`  ✅ Câu ${i + 1} (Nhánh A): Cần ${neededSpeed.toFixed(2)}x <= 1.55x. Dùng bản 1.4x->1.55x.`, 'success');
-                  } else if (neededSpeed <= 1.8) {
-                      // Nhánh B
-                      let renderSpeed2 = neededSpeed - 0.15;
-                      let exportIdRef2: { current: string | null } = { current: null };
-                      let buffer2 = await runTTS(cleanText, renderSpeed2, i, exportIdRef2, false, activeProvider, activeVoiceId);
-                      let decoded2 = await audioCtx.decodeAudioData(buffer2.slice(0));
-                      finalBuffer = await applyTimeStretch(decoded2, neededSpeed / renderSpeed2);
-                      let decodedFinal2 = await audioCtx.decodeAudioData(finalBuffer.slice(0));
-                      let diff2 = decodedFinal2.duration - targetDuration;
-                      if (Math.abs(diff2) > 0.1) {
-                          addLog(`  ⚠️ Verify Nhánh B: Câu ${i + 1} lệch ${diff2.toFixed(2)}s so với dự kiến.`, 'warning');
-                      }
-                      addLog(`  ✅ Câu ${i + 1} (Nhánh B): Cần ${neededSpeed.toFixed(2)}x. Render lại ${renderSpeed2.toFixed(2)}x -> ép ${neededSpeed.toFixed(2)}x.`, 'success');
+                  // Bước 3: Phân nhánh theo ngưỡng người dùng cài đặt
+                  if (neededSpeed <= minAutoFitSpeed) {
+                      // Nhánh A: Thừa thời gian -> giữ nguyên tốc độ Min
+                      finalBuffer = buffer1;
+                      addLog(`  ✅ Câu ${i + 1} (Nhánh A): Cần ${neededSpeed.toFixed(2)}x <= Min (${minAutoFitSpeed}x). Giữ nguyên tốc độ Min.`, 'success');
+                  } else if (neededSpeed <= maxAutoFitSpeed) {
+                      // Nhánh B: Trong dải cho phép -> ép tốc độ vừa khít
+                      finalBuffer = await applyTimeStretch(decoded1, neededSpeed / renderSpeed1);
+                      addLog(`  ✅ Câu ${i + 1} (Nhánh B): Cần ${neededSpeed.toFixed(2)}x. Ép từ ${renderSpeed1}x -> ${neededSpeed.toFixed(2)}x.`, 'success');
                   } else {
                       // Nhánh C
                       let gap = 0.3;
@@ -1100,55 +1088,27 @@ if (activeProvider === 'omnivoice') {
                           if (gap < 0) gap = 0;
                       }
                       
-                      let actualDurationAt1_8 = (rawDuration * 1.4) / 1.8;
-                      let overflow = actualDurationAt1_8 - targetDuration;
-
-                      if (overflow <= gap) {
-                          // Nhánh C1
-                          let exportIdRefC1: { current: string | null } = { current: null };
-                          let bufferC1 = await runTTS(cleanText, 1.65, i, exportIdRefC1, false, activeProvider, activeVoiceId);
-                          let decodedC1 = await audioCtx.decodeAudioData(bufferC1.slice(0));
-                          finalBuffer = await applyTimeStretch(decodedC1, 1.8 / 1.65);
-                          addLog(`  ✅ Câu ${i + 1} (Nhánh C1): Vượt 1.8x, đủ gap chứa. Render 1.65x -> ép 1.8x.`, 'success');
+                      let neededSpeedWithGap = (rawDuration * renderSpeed1) / (targetDuration + gap);
+                      if (neededSpeedWithGap <= maxAutoFitSpeed) {
+                          finalBuffer = await applyTimeStretch(decoded1, neededSpeedWithGap / renderSpeed1);
+                          addLog(`  ✅ Câu ${i + 1} (Nhánh C): Mượn gap (${gap.toFixed(2)}s), ép tốc độ ${neededSpeedWithGap.toFixed(2)}x (<= Max ${maxAutoFitSpeed}x).`, 'success');
                       } else {
-                          // Nhánh C2
-                          let neededSpeedWithGap = (rawDuration * 1.4) / (targetDuration + gap);
-                          if (neededSpeedWithGap <= 2.1) {
-                              // Nhánh C2a
-                              let renderSpeedC2a = neededSpeedWithGap - 0.15;
-                              let exportIdRefC2a: { current: string | null } = { current: null };
-                              let bufferC2a = await runTTS(cleanText, renderSpeedC2a, i, exportIdRefC2a, false, activeProvider, activeVoiceId);
-                              let decodedC2a = await audioCtx.decodeAudioData(bufferC2a.slice(0));
-                              finalBuffer = await applyTimeStretch(decodedC2a, neededSpeedWithGap / renderSpeedC2a);
-                              let decodedFinalC2a = await audioCtx.decodeAudioData(finalBuffer.slice(0));
-                              let diffC2a = decodedFinalC2a.duration - (targetDuration + gap);
-                              if (Math.abs(diffC2a) > 0.1) {
-                                  addLog(`  ⚠️ Verify Nhánh C2a: Câu ${i + 1} lệch ${diffC2a.toFixed(2)}s so với dự kiến.`, 'warning');
-                              }
-                              addLog(`  ✅ Câu ${i + 1} (Nhánh C2a): Mượn gap, cần ${neededSpeedWithGap.toFixed(2)}x. Render ${renderSpeedC2a.toFixed(2)}x -> ép ${neededSpeedWithGap.toFixed(2)}x.`, 'success');
+                          if (hasGeminiKey) {
+                              rewriteQueue.push({
+                                  index: i,
+                                  cleanText,
+                                  actualDuration: rawDuration * (renderSpeed1 / minAutoFitSpeed),
+                                  targetDuration: targetDuration + gap,
+                                  originalBuffer: null as any
+                              });
+                              addLog(`  🔮 Câu ${i + 1} cần ${neededSpeedWithGap.toFixed(2)}x vượt trần Max (${maxAutoFitSpeed}x). Đưa vào hàng đợi AI rút gọn.`, 'warning');
+                              sentenceSuccess = true;
+                              updateProgress(++completedInitial, completedRewrite, rewriteQueue.length);
+                              continue; // Skip setting audioClips[i]
                           } else {
-                                // MỚI: vượt 2.1x -> đẩy vào AI rewrite queue thay vì ép cứng
-                                if (hasGeminiKey) {
-                                  rewriteQueue.push({
-                                      index: i,
-                                      cleanText,
-                                      actualDuration: rawDuration * (1.4 / NORMAL_SPEED),
-                                      targetDuration: targetDuration + gap,
-                                      originalBuffer: null as any
-                                  });
-                                  addLog(`  🔮 Câu ${i + 1} vượt 2.1x (cần ${neededSpeedWithGap.toFixed(2)}x). Đưa vào hàng đợi AI rút gọn dù đã tắt AI Rewrite.`, 'warning');
-                                  sentenceSuccess = true;
-                                  updateProgress(++completedInitial, completedRewrite, rewriteQueue.length);
-                                  continue; // Skip setting audioClips[i]
-                              } else {
-                                  // Không có key -> fallback ép 2.1x
-                                  let exportIdRefFallback: { current: string | null } = { current: null };
-                                  let bufferFallback = await runTTS(cleanText, 1.95, i, exportIdRefFallback, false, activeProvider, activeVoiceId);
-                                  let decodedFallback = await audioCtx.decodeAudioData(bufferFallback.slice(0));
-                                  finalBuffer = await applyTimeStretch(decodedFallback, 2.1 / 1.95);
-                                  addLog(`  ⚠️ Câu ${i + 1} vượt 2.1x nhưng không có key AI. Ép cứng 2.1x.`, 'warning');
-                                  reportListRef.current.push({ index: i+1, overflow: ((rawDuration*1.4)/2.1)-(targetDuration+gap), gap, text: cleanText });
-                              }
+                              finalBuffer = await applyTimeStretch(decoded1, maxAutoFitSpeed / renderSpeed1);
+                              addLog(`  ⚠️ Câu ${i + 1} vượt trần Max (${maxAutoFitSpeed}x) nhưng không có key AI. Ép tối đa về ${maxAutoFitSpeed}x.`, 'warning');
+                              reportListRef.current.push({ index: i+1, overflow: ((rawDuration*renderSpeed1)/maxAutoFitSpeed)-(targetDuration+gap), gap, text: cleanText });
                           }
                       }
                   }
@@ -1249,7 +1209,7 @@ const isGroupedSentence = smartGroup && sub.text.includes(', ');
                   } else if (!bestNewPreset && actualNeededSpeed > MID_CAP_SPEED) {
                       // Vượt quá preset lớn nhất (1.8x)
                       targetSpeedToUse = MID_CAP_SPEED;
-                      addLog(`  ⚠️ Câu ${i+1} cần tốc độ > 1.8x. Ép về 1.8x và xem xét AI.`, 'warning');
+                      addLog(`  ⚠️ Câu ${i+1} cần tốc độ > ${MID_CAP_SPEED}x. Ép về ${MID_CAP_SPEED}x và xem xét AI.`, 'warning');
                   }
               }
 
@@ -1319,8 +1279,8 @@ const isGroupedSentence = smartGroup && sub.text.includes(', ');
                 if (!item.currentTextToRewrite) item.currentTextToRewrite = item.cleanText;
 
                 let currentChars = item.currentTextToRewrite.length;
-                let targetSpeedForRewrite = Math.max(NORMAL_SPEED, MID_CAP_SPEED);
-                let ratio = item.targetDuration / (item.actualDuration * (NORMAL_SPEED / targetSpeedForRewrite));
+                let targetSpeedForRewrite = maxAutoFitSpeed;
+                let ratio = item.targetDuration / (item.actualDuration * (minAutoFitSpeed / targetSpeedForRewrite));
                 let targetChars = Math.floor(currentChars * ratio);
 
                 if (!item.finalTargetChars) {
@@ -1358,14 +1318,14 @@ const isGroupedSentence = smartGroup && sub.text.includes(', ');
                         item.bestRewrite = rewritten;
 
                         item.exportIdRef = item.exportIdRef || { current: null };
-                        let testBuffer = await runTTS(rewritten, 1.65, item.index, item.exportIdRef, false, activeProvider, activeVoiceId);
+                        let testBuffer = await runTTS(rewritten, minAutoFitSpeed, item.index, item.exportIdRef, false, activeProvider, activeVoiceId);
                         let testDecoded = await audioCtx.decodeAudioData(testBuffer.slice(0));
-                        const rewriteStretchRatio = (item.targetSpeedForRewrite || MID_CAP_SPEED) / 1.65;
+                        const rewriteStretchRatio = (item.targetSpeedForRewrite || maxAutoFitSpeed) / minAutoFitSpeed;
                         testBuffer = await applyTimeStretch(testDecoded, rewriteStretchRatio);
 
                         item.newArrayBuffer = testBuffer;
                         item.rewriteSuccess = true;
-                        addLog(`  💡 Câu ${item.index + 1} rút gọn thành công: "${rewritten}" (render 1.65→${item.targetSpeedForRewrite || MID_CAP_SPEED}x)`, 'success');
+                        addLog(`  💡 Câu ${item.index + 1} rút gọn thành công: "${rewritten}" (render ${minAutoFitSpeed}→${(item.targetSpeedForRewrite || maxAutoFitSpeed).toFixed(2)}x)`, 'success');
                     }
                 } else {
                     throw new Error("HTTP " + res.status);
@@ -1393,11 +1353,11 @@ const isGroupedSentence = smartGroup && sub.text.includes(', ');
         for (const item of rewriteQueue) {
            const sub = processedSubs[item.index];
            if (!item.rewriteSuccess) {
-               addLog(`  ⚠️ Câu ${item.index + 1} rút gọn thất bại. Ép audio gốc về tốc độ trần (render 1.65x, stretch 1.8x).`, 'warning');
+               addLog(`  ⚠️ Câu ${item.index + 1} rút gọn thất bại. Ép audio gốc về tốc độ trần (render ${minAutoFitSpeed}x, stretch ${maxAutoFitSpeed}x).`, 'warning');
                let exportIdRef: { current: string | null } = { current: null };
-               const fallbackBuffer = await runTTS(item.cleanText, 1.65, item.index, exportIdRef, false, activeProvider, activeVoiceId);
+               const fallbackBuffer = await runTTS(item.cleanText, minAutoFitSpeed, item.index, exportIdRef, false, activeProvider, activeVoiceId);
                const fallbackDecoded = await audioCtx.decodeAudioData(fallbackBuffer.slice(0));
-               item.newArrayBuffer = await applyTimeStretch(fallbackDecoded, MID_CAP_SPEED / 1.65);
+               item.newArrayBuffer = await applyTimeStretch(fallbackDecoded, maxAutoFitSpeed / minAutoFitSpeed);
            }
 
            const prefix = sub.text.trim().startsWith('-') ? '- ' : '';
@@ -1463,7 +1423,7 @@ const isGroupedSentence = smartGroup && sub.text.includes(', ');
 
             if (reportListRef.current.length > 0) {
         addLog(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, 'warning');
-        addLog(`⚠️ ${reportListRef.current.length} câu chạm trần 2.1x, cần kiểm tra lại:`, 'warning');
+        addLog(`⚠️ ${reportListRef.current.length} câu chạm trần ${maxAutoFitSpeed}x, cần kiểm tra lại:`, 'warning');
         reportListRef.current.forEach(p => {
             addLog(`  • Câu ${p.index} — dư ${p.overflow.toFixed(2)}s (gap ${p.gap.toFixed(2)}s): "${p.text}"`, 'warning');
         });

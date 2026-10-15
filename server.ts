@@ -151,7 +151,7 @@ async function startServer() {
       let lastError;
       let keyIndex = globalGeminiKeyIndex++;
       
-      const geminiModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.6-pro"];
+      const geminiModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
       let success = false;
       let maxRetries = 15;
       
@@ -159,7 +159,7 @@ async function startServer() {
           const currentKey = apiKeys[keyIndex % apiKeys.length];
           const isGrok = currentKey.startsWith("xai-");
           const isDeepSeek = currentKey.startsWith("sk-");
-          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-v4-flash" : geminiModels[(attempt - 1) % geminiModels.length]);
+          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-chat" : geminiModels[(attempt - 1) % geminiModels.length]);
           
           try {
               if (isGrok || isDeepSeek) {
@@ -194,9 +194,10 @@ async function startServer() {
                   success = true;
                   break;
               }
-          } catch (error) {
+          } catch (error: any) {
               lastError = error;
-              const errMsg = String(error.message || error);
+              const errMsg = String(error?.message || error);
+              console.warn(`[AI Rewrite Batch] Attempt ${attempt} failed with ${model}:`, errMsg);
               if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
                   keyIndex++; globalGeminiKeyIndex = keyIndex; await new Promise(r => setTimeout(r, 1000)); continue;
               } else if (errMsg.includes("503") || errMsg.includes("High demand")) {
@@ -210,8 +211,13 @@ async function startServer() {
       
       let parsed = [];
       try {
-         resultText = resultText.replace(/^[\\s\\S]*?\[/i, '[').replace(/\][\\s\\S]*$/i, ']');
-         parsed = JSON.parse(resultText);
+         let cleanJson = resultText.replace(/```json/gi, '').replace(/```/g, '').trim();
+         const firstBracket = cleanJson.indexOf('[');
+         const lastBracket = cleanJson.lastIndexOf(']');
+         if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+           cleanJson = cleanJson.substring(firstBracket, lastBracket + 1);
+         }
+         parsed = JSON.parse(cleanJson);
       } catch (e) {
          console.warn("Failed to parse batch JSON response:", resultText);
          throw new Error("Invalid JSON format from AI");
@@ -271,9 +277,9 @@ Câu gốc cần rút gọn:
       let keyIndex = globalGeminiKeyIndex++;
       
       const geminiModels = [
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-3.6-pro"
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash"
       ];
       
       let success = false;
@@ -283,7 +289,7 @@ Câu gốc cần rút gọn:
           const currentKey = apiKeys[keyIndex % apiKeys.length];
           const isGrok = currentKey.startsWith("xai-");
           const isDeepSeek = currentKey.startsWith("sk-");
-          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-v4-flash" : geminiModels[(attempt - 1) % geminiModels.length]);
+          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-chat" : geminiModels[(attempt - 1) % geminiModels.length]);
           
           try {
               if (isGrok || isDeepSeek) {
