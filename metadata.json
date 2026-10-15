@@ -1,0 +1,6 @@
+{
+  "name": "VClip Dubbing Script",
+  "description": "A Python script generator for automating movie dubbing from SRT files using VClip API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

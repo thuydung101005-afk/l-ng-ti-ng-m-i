@@ -1,0 +1,560 @@
+import express from "express";
+import path from "path";
+import fs from "fs";
+import os from "os";
+import crypto from "crypto";
+import { exec } from "child_process";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI } from "@google/genai";
+import dotenv from "dotenv";
+dotenv.config();
+
+let globalGeminiKeyIndex = 0;
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.raw({ type: 'audio/wav', limit: '50mb' }));
+
+  const { spawn } = await import("child_process");
+
+  app.post("/api/ffmpeg/atempo", (req, res) => {
+    let speed = parseFloat(req.query.speed as string);
+    if (isNaN(speed) || speed <= 0) {
+      return res.status(400).json({ error: "Invalid speed parameter. Must be greater than 0" });
+    }
+
+    const filters: string[] = ['apad=pad_dur=0.5'];
+    // Đệm 0.5s silence trước khi vào atempo để WSOLA xả trọn vẹn trong khoảng lặng, triệt tiêu hoàn toàn tiếng khựng ré loa
+    
+    while (speed > 2.0) {
+      filters.push('atempo=2.0');
+      speed /= 2.0;
+    }
+    while (speed < 0.5) {
+      filters.push('atempo=0.5');
+      speed /= 0.5;
+    }
+    if (speed !== 1.0 || filters.length === 1) {
+      filters.push(`atempo=${speed}`);
+    }
+    const filterStr = filters.join(',');
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', 'pipe:0',
+      '-filter:a', filterStr,
+      '-f', 'wav',
+      'pipe:1'
+    ]);
+
+    ffmpeg.stdin.on('error', () => {});
+    ffmpeg.stdin.write(req.body);
+    ffmpeg.stdin.end();
+
+    const chunks: Buffer[] = [];
+    let stderrStr = '';
+    ffmpeg.stdout.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    ffmpeg.stderr.on('data', (chunk) => { stderrStr += chunk.toString(); });
+
+    ffmpeg.on('close', (code) => {
+      if (code === 0) {
+        const resultBuffer = Buffer.concat(chunks);
+        res.setHeader("Content-Type", "audio/wav");
+        res.send(resultBuffer);
+      } else {
+        res.status(500).json({ error: `FFmpeg exited with code ${code}: ${stderrStr}` });
+      }
+    });
+  });
+  
+    app.post('/api/rubberband/stretch', async (req, res) => {
+    let speed = parseFloat(req.query.speed as string);
+    if (isNaN(speed) || speed <= 0) {
+      return res.status(400).json({ error: 'Invalid speed parameter' });
+    }
+
+    const tmpDir = 'D:\\temp_rubberband';
+    const id = crypto.randomUUID();
+    const inFile = path.join(tmpDir, `in_${id}.wav`);
+    const outFile = path.join(tmpDir, `out_${id}.wav`);
+
+    try {
+      fs.writeFileSync(inFile, req.body);
+      const exePath = path.resolve('./rubberband.exe');
+      
+      // Use R3 engine (-3) for best quality, preserve formants (-F), and change tempo (-T)
+      const cmd = `"${exePath}" -3 -F -T ${speed.toFixed(4)} "${inFile}" "${outFile}"`;
+      
+      exec(cmd, (error, stdout, stderr) => {
+        if (error) {
+          console.error('Rubberband error:', stderr);
+          fs.unlinkSync(inFile);
+          return res.status(500).json({ error: 'Rubberband failed' });
+        }
+        
+        try {
+          const resultBuffer = fs.readFileSync(outFile);
+          res.setHeader('Content-Type', 'audio/wav');
+          res.send(resultBuffer);
+        } catch (readErr) {
+          res.status(500).json({ error: 'Failed to read output file' });
+        } finally {
+          try { fs.unlinkSync(inFile); } catch(e){}
+          try { fs.unlinkSync(outFile); } catch(e){}
+        }
+      });
+    } catch (err) {
+      console.error("RUBBERBAND ROUTE CATCH ERROR:", err);
+      res.status(500).json({ error: 'Failed to process request', details: String(err) });
+    }
+  });
+
+  app.get("/api/gemini/default-keys", (req, res) => {
+    const raw = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "";
+    const formatted = raw.replace(/\\n/g, '\n');
+    res.json({ keys: formatted });
+  });
+
+  app.post("/api/gemini/rewrite-batch", async (req, res) => {
+    try {
+      const { items, clientGeminiKeysStr } = req.body;
+      
+      const clientKeys = typeof clientGeminiKeysStr === 'string' 
+        ? clientGeminiKeysStr.split(/[\n,]+/).map((k) => k.trim()).filter(Boolean)
+        : [];
+        
+      const envKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+        .replace(/\\n/g, '\n')
+        .split(/[\n,]+/).map((k) => k.trim()).filter(Boolean);
+      const apiKeys = clientKeys.length > 0 ? clientKeys : envKeys;
+
+      if (apiKeys.length === 0) {
+        return res.status(500).json({ error: "Thieu biến môi trường GEMINI_API_KEY hoặc GEMINI_API_KEYS ở server và không có key dự phòng" });
+      }
+
+      let prompt = "Hãy viết lại và rút gọn các câu dưới đây theo yêu cầu cho từng câu.\nYêu cầu BẮT BUỘC:\n- BẮT BUỘC phải rút gọn nội dung ngắn hơn câu gốc, NHƯNG giữ nguyên ý nghĩa cốt lõi.\n- Trả về KẾT QUẢ DƯỚI DẠNG MẢNG JSON, KHÔNG BỌC TRONG MARKDOWN CODE BLOCK, CHỈ TRẢ VỀ CHÍNH XÁC ARRAY JSON.\n- Mảng JSON trả về PHẢI CHỨA CHÍNH XÁC " + items.length + " phần tử, tương ứng với " + items.length + " câu đầu vào theo đúng thứ tự.\n- Mỗi phần tử chứa một trường 'result' mang nội dung đã rút gọn.\n- Độ dài 'result' không được vượt quá số ký tự tối đa yêu cầu.\n\nDữ liệu đầu vào:\n";
+      
+      items.forEach((item, index) => {
+        prompt += "\n[Câu số " + (item.id + 1) + "]\n";
+        if (item.targetChars) prompt += "- Độ dài tối đa: " + item.targetChars + " ký tự.\n";
+        if (item.targetDuration && item.targetSpeed) prompt += "- Thời gian mục tiêu: " + Number(item.targetDuration).toFixed(2) + "s ở tốc độ " + Number(item.targetSpeed).toFixed(1) + "x.\n";
+        if (item.previousText) prompt += "- Câu trước: '" + item.previousText + "'\n";
+        if (item.nextText) prompt += "- Câu sau: '" + item.nextText + "'\n";
+        prompt += "- Nội dung gốc: '" + item.text + "'\n";
+      });
+      
+      let resultText = "";
+      let lastError;
+      let keyIndex = globalGeminiKeyIndex++;
+      
+      const geminiModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.6-pro"];
+      let success = false;
+      let maxRetries = 15;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          const currentKey = apiKeys[keyIndex % apiKeys.length];
+          const isGrok = currentKey.startsWith("xai-");
+          const isDeepSeek = currentKey.startsWith("sk-");
+          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-v4-flash" : geminiModels[(attempt - 1) % geminiModels.length]);
+          
+          try {
+              if (isGrok || isDeepSeek) {
+                  const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
+                  const res = await fetch(apiUrl, {
+                      method: "POST",
+                      headers: {
+                          "Content-Type": "application/json",
+                          "Authorization": "Bearer " + currentKey
+                      },
+                      body: JSON.stringify({
+                          messages: [{ role: "user", content: prompt }],
+                          model: model,
+                          temperature: 0.2
+                      })
+                  });
+                  if (!res.ok) throw new Error("HTTP " + res.status + ": " + await res.text());
+                  const data = await res.json();
+                  resultText = data.choices[0].message.content.trim();
+                  success = true;
+                  break;
+              } else {
+                  const ai = new GoogleGenAI({ apiKey: currentKey });
+                  const geminiResponse = await ai.models.generateContent({
+                      model: model,
+                      contents: prompt,
+                      config: {
+                          responseMimeType: "application/json"
+                      }
+                  });
+                  resultText = geminiResponse.text?.trim() || "";
+                  success = true;
+                  break;
+              }
+          } catch (error) {
+              lastError = error;
+              const errMsg = String(error.message || error);
+              if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+                  keyIndex++; globalGeminiKeyIndex = keyIndex; await new Promise(r => setTimeout(r, 1000)); continue;
+              } else if (errMsg.includes("503") || errMsg.includes("High demand")) {
+                  await new Promise(r => setTimeout(r, 2000)); continue;
+              }
+              keyIndex++; globalGeminiKeyIndex = keyIndex; continue;
+          }
+      }
+      
+      if (!success) throw lastError || new Error("Failed to generate content");
+      
+      let parsed = [];
+      try {
+         resultText = resultText.replace(/^[\\s\\S]*?\[/i, '[').replace(/\][\\s\\S]*$/i, ']');
+         parsed = JSON.parse(resultText);
+      } catch (e) {
+         console.warn("Failed to parse batch JSON response:", resultText);
+         throw new Error("Invalid JSON format from AI");
+      }
+      
+      console.log("[AI Rewrite Result]:", JSON.stringify(parsed, null, 2));
+      res.json({ result: parsed });
+    } catch (error) {
+      console.error("[Gemini Batch Rewrite] Error:", error);
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.post("/api/gemini/rewrite", async (req, res) => {
+    try {
+      const { text, currentDurationMs, targetDurationMs, previousText, nextText, clientGeminiKeysStr, attempt, originalText } = req.body;
+      
+      const clientKeys = typeof clientGeminiKeysStr === 'string' 
+        ? clientGeminiKeysStr.split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean)
+        : [];
+        
+      const envKeys = (process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || "")
+        .replace(/\\n/g, '\n')
+        .split(/[\n,]+/).map((k: string) => k.trim()).filter(Boolean);
+      const apiKeys = (clientKeys.length > 0 ? clientKeys : envKeys) as string[];
+
+      if (apiKeys.length === 0) {
+        return res.status(500).json({ error: "Thieu biến môi trường GEMINI_API_KEY hoặc GEMINI_API_KEYS ở server và không có key dự phòng" });
+      }
+      
+      let contextStr = "";
+      if (previousText || nextText) {
+          contextStr = `\nNgữ cảnh (không thay đổi ngữ cảnh, chỉ dùng để hiểu ý nghĩa):\n`;
+          if (previousText) contextStr += `Câu trước: "${previousText}"\n`;
+          if (nextText) contextStr += `Câu sau: "${nextText}"\n`;
+      }
+      
+            let durationStr = "";
+      if (req.body.targetChars) {
+          durationStr += `\n- Độ dài tối đa: Rút gọn sao cho độ dài TỐI ĐA khoảng ${req.body.targetChars} ký tự.`;
+      }
+      if (req.body.targetDuration && req.body.targetSpeed) {
+          durationStr += `\n- Yêu cầu thời gian: Câu rút gọn nên đọc xong trong ${Number(req.body.targetDuration).toFixed(2)} giây (ở tốc độ ${Number(req.body.targetSpeed).toFixed(1)}x).`;
+      }
+
+      const prompt = `Hãy viết lại và rút gọn câu dưới đây sao cho thật súc tích, mạch lạc và tự nhiên.
+Yêu cầu BẮT BUỘC:${durationStr}
+- Giữ nguyên ý nghĩa cốt lõi của câu gốc, đảm bảo câu văn mạch lạc, đúng nghĩa cũ và trôi chảy.
+- Không thêm nội dung, không giải thích, không tự ý bình luận.
+- CHỈ ĐƯỢC trả về nội dung câu đã rút gọn, KHÔNG giải thích, KHÔNG thêm ngoặc kép.
+${contextStr}
+Câu gốc cần rút gọn:
+"${text}"`;
+
+      let resultText = "";
+      let lastError;
+      let keyIndex = globalGeminiKeyIndex++;
+      
+      const geminiModels = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.6-pro"
+      ];
+      
+      let success = false;
+      let maxRetries = 15;
+      
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          const currentKey = apiKeys[keyIndex % apiKeys.length];
+          const isGrok = currentKey.startsWith("xai-");
+          const isDeepSeek = currentKey.startsWith("sk-");
+          const model = isGrok ? "grok-2-latest" : (isDeepSeek ? "deepseek-v4-flash" : geminiModels[(attempt - 1) % geminiModels.length]);
+          
+          try {
+              if (isGrok || isDeepSeek) {
+                  const apiUrl = isGrok ? "https://api.x.ai/v1/chat/completions" : "https://api.deepseek.com/v1/chat/completions";
+                  const res = await fetch(apiUrl, {
+                      method: "POST",
+                      headers: {
+                          "Content-Type": "application/json",
+                          "Authorization": `Bearer ${currentKey}`
+                      },
+                      body: JSON.stringify({
+                          messages: [
+                              { role: "user", content: prompt }
+                          ],
+                          model: model,
+                          temperature: 0.3
+                      })
+                  });
+                  if (!res.ok) {
+                      const errData = await res.text();
+                      throw new Error(`HTTP ${res.status}: ${errData}`);
+                  }
+                  const data = await res.json();
+                  resultText = data.choices[0].message.content.trim();
+                  success = true;
+                  break;
+              } else {
+                  const ai = new GoogleGenAI({ apiKey: currentKey });
+                  const geminiResponse = await ai.models.generateContent({
+                      model: model,
+                      contents: prompt,
+                  });
+                  resultText = geminiResponse.text?.trim() || "";
+                  success = true;
+                  break;
+              }
+          } catch (error: any) {
+              lastError = error;
+              const errMsg = String(error.message || error);
+              if (errMsg.includes("429") || errMsg.includes("Quota") || errMsg.includes("RESOURCE_EXHAUSTED")) {
+                  console.warn(`[AI Rewrite] Attempt ${attempt} failed for ${model} (429 Quota). Switching key...`);
+                  keyIndex++;
+                  globalGeminiKeyIndex = keyIndex;
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  continue;
+              } else if (errMsg.includes("503") || errMsg.includes("High demand")) {
+                  console.warn(`[AI Rewrite] Attempt ${attempt} failed for ${model} (503). Retrying...`);
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  continue;
+              }
+              console.warn(`[AI Rewrite] Model ${model} failed:`, errMsg);
+              keyIndex++;
+              globalGeminiKeyIndex = keyIndex;
+              continue;
+          }
+      }
+      if (!success) {
+        throw lastError || new Error("Failed to generate content after multiple attempts");
+      }
+      res.json({ result: resultText });
+    } catch (error) {
+      console.error("[Gemini Rewrite] Error:", error);
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.post("/api/vclip/rpc", async (req, res) => {
+    const { apiKey, payload } = req.body;
+    
+    if (!payload?.input && !payload?.method) {
+      return res.status(400).json({ error: { message: "Internal Proxy Error: Missing payload structure" }});
+    }
+
+    try {
+      console.log(`[Proxy] Sending to VClip | Method: ${payload.method} | id: ${payload.id}`);
+      
+      const response = await fetch("https://api-tts.vclip.io/json-rpc", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
+      
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text);
+        res.status(response.status).json(data);
+      } catch (e) {
+        res.status(response.status || 500).json({ error: { message: `Upstream HTTP ${response.status}: ${text.substring(0, 200)}` } });
+      }
+    } catch (error) {
+      console.error("[Proxy] Error:", error);
+      res.status(500).json({ error: { message: String(error) } });
+    }
+  });
+
+  app.get('/api/aivoices/voices', async (req, res) => {
+    try {
+      const response = await fetch('https://tts-api.achihub.com/api/tts/voices');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/aivoices/synthesize', async (req, res) => {
+    try {
+      const { voice_id, script_text, speed, pitch, apiKey } = req.body;
+      const response = await fetch('https://tts-api.achihub.com/api/tts/synthesize', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ voice_id, script_text, speed: speed || 1.0, pitch: pitch || 0 })
+      });
+      const data = await response.json();
+      if (!response.ok) return res.status(response.status).json(data);
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get('/api/aivoices/job/:id', async (req, res) => {
+    try {
+      const apiKey = req.headers.authorization?.split(' ')[1];
+      const response = await fetch(`https://tts-api.achihub.com/api/tts/${req.params.id}`, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`
+        }
+      });
+      const data = await response.json();
+      if (!response.ok) return res.status(response.status).json(data);
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/omnivoice/generate', async (req, res) => {
+    try {
+      const { text, voice_id, speed, target_duration, postprocess_output } = req.body;
+
+      // Đọc URL linh hoạt từ .env (tự động cập nhật không cần khởi động lại server)
+      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
+      try {
+        const envPath = path.resolve(process.cwd(), '.env');
+        if (fs.existsSync(envPath)) {
+          const envContent = fs.readFileSync(envPath, 'utf8');
+          const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
+          if (match && match[1]?.trim()) {
+            omniBase = match[1].trim().replace(/^["']|["']$/g, '');
+          }
+        }
+      } catch (e) {}
+      omniBase = omniBase.replace(/\/+$/, '');
+
+      if (req.body && typeof req.body.text === 'string') {
+        let t = req.body.text.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ').trim();
+        t = t.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
+        t = t.replace(/…+/g, '.').replace(/\.{2,}/g, '.');
+        t = t.replace(/[,;:\-–—~]+$/, '').trim();
+        t = t.replace(/,(\s*)([^\s])/g, (_, space, char) => ',' + space + char.toLowerCase());
+        if (/[.!?]$/.test(t)) {
+          t = t.replace(/[\s\.]*([.!?])$/, '$1');
+        } else if (t.length > 0) {
+          t += '.';
+        }
+        req.body.text = t;
+      }
+
+      console.log(`[OmniVoice] Gửi text đến: ${omniBase}/generate | "${req.body?.text}"`);
+      const response = await fetch(`${omniBase}/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(req.body)
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        return res.status(response.status).json({ error: `OmniVoice error: ${errorText}` });
+      }
+      
+      const arrayBuffer = await response.arrayBuffer();
+      res.setHeader("Content-Type", "audio/wav");
+      res.send(Buffer.from(arrayBuffer));
+    } catch (error: any) {
+      console.error("[OmniVoice] Error:", error);
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.get('/api/omnivoice/voices', async (req, res) => {
+    try {
+      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
+      const envPath = path.resolve(process.cwd(), '.env');
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
+        if (match && match[1]?.trim()) omniBase = match[1].trim().replace(/^["']|["']$/g, '');
+      }
+      omniBase = omniBase.replace(/\/+$/, '');
+      const response = await fetch(`${omniBase}/voices`);
+      const data = await response.json();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  app.get('/api/omnivoice/health', async (req, res) => {
+    try {
+      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
+      const envPath = path.resolve(process.cwd(), '.env');
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
+        if (match && match[1]?.trim()) omniBase = match[1].trim().replace(/^["']|["']$/g, '');
+      }
+      omniBase = omniBase.replace(/\/+$/, '');
+      const response = await fetch(`${omniBase}/health`);
+      const data = await response.json();
+      res.json(data);
+    } catch (error: any) {
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  // Proxy the audio file download to avoid CORS issues
+  app.post("/api/proxy-download", async (req, res) => {
+    const { url } = req.body;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        return res.status(response.status).json({ error: `Upstream error: ${response.statusText}` });
+      }
+      const arrayBuffer = await response.arrayBuffer();
+      res.setHeader("Content-Type", response.headers.get("Content-Type") || "audio/mpeg");
+      res.send(Buffer.from(arrayBuffer));
+    } catch (error) {
+      res.status(500).json({ error: String(error) });
+    }
+  });
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
+
+

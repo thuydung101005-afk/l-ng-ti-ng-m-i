@@ -1,0 +1,116 @@
+// ===== LUỒNG RIÊNG CHO OMNIVOICE =====
+if (activeProvider === 'omnivoice') {
+  addLog('🎯 Dùng OmniVoice: luồng xử lý 2-pass (Autofit & AI Rewrite).', 'info');
+  const totalSubs = processedSubs.length;
+  const audioClips: ({ buffer: ArrayBuffer; startTime: number } | null)[] = new Array(totalSubs).fill(null);
+  const hasGeminiKey = geminiApiKeysStr.trim().length > 0;
+  
+  for (let i = 0; i < totalSubs; i++) {
+    const sub = processedSubs[i];
+    let cleanText = sub.text.trim();
+    if (cleanText.startsWith('-')) cleanText = cleanText.substring(1).trim();
+    if (!cleanText) continue;
+
+    let targetDuration = sub.end - sub.start;
+    if (i < totalSubs - 1) {
+      const nextSub = processedSubs[i + 1];
+      if (sub.start + targetDuration > nextSub.start) targetDuration = nextSub.start - sub.start;
+    }
+    if (targetDuration <= 0) targetDuration = 0.1;
+
+    let finalText = cleanText;
+    let finalBuffer: ArrayBuffer | null = null;
+    let success = false;
+    let attempts = 0;
+    
+    addLog(`[${i + 1}/${totalSubs}] Đang xử lý: "${cleanText.length > 40 ? cleanText.substring(0, 40) + '...' : cleanText}"`, 'info');
+
+    while (!success && attempts < 3) {
+      attempts++;
+      try {
+        addLog(`  ⏳ (Pass 1) Render thử tốc độ 1.45x...`, 'info');
+        let buffer = await runOmnivoiceRaw(finalText, 1.45, activeVoiceId);
+        
+        let decoded = await audioCtx.decodeAudioData(buffer.slice(0));
+        let actualDuration = decoded.duration;
+        let neededSpeed = (actualDuration * 1.45) / targetDuration;
+        
+        if (!autoFit || neededSpeed <= 1.45) {
+           if (neededSpeed <= 1.45) {
+              addLog(`  ✅ Vừa vặn trong slot (tốc độ tự nhiên tương đương ${neededSpeed.toFixed(2)}x). Dùng luôn bản 1.45x.`, 'success');
+           } else {
+              addLog(`  ⚠️ Bị tràn thời gian nhưng AutoFit đang TẮT. Chốt bản 1.45x.`, 'warning');
+           }
+           finalBuffer = buffer;
+        } else {
+           if (neededSpeed <= 1.8) {
+              addLog(`  ⏳ (Pass 2) Cần tốc độ ${neededSpeed.toFixed(2)}x (<= 1.8x). Render lại với tốc độ này...`, 'warning');
+              finalBuffer = await runOmnivoiceRaw(finalText, neededSpeed, activeVoiceId);
+              addLog(`  ✅ Đã render xong với tốc độ ${neededSpeed.toFixed(2)}x để vừa khít SRT.`, 'success');
+           } else {
+              if (aiRewrite && hasGeminiKey) {
+                 addLog(`  🔮 Cần tốc độ ${neededSpeed.toFixed(2)}x (> 1.8x). Đang gọi AI rút gọn...`, 'warning');
+                 let targetChars = Math.max(10, Math.floor(finalText.length * (targetDuration / actualDuration) * 0.9));
+                 
+                 let previousText = "";
+                 if (i > 0) previousText = processedSubs[i-1].text.trim().replace(/^-/, '').trim();
+                 let nextText = "";
+                 if (i < totalSubs - 1) nextText = processedSubs[i+1].text.trim().replace(/^-/, '').trim();
+                 
+                 const res = await fetch('/api/gemini/rewrite', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      text: finalText,
+                      previousText,
+                      nextText,
+                      targetChars,
+                      targetDuration,
+                      targetSpeed: 1.45,
+                      clientGeminiKeysStr: geminiApiKeysStr,
+                    }),
+                 });
+                 
+                 if (res.ok) {
+                    const data = await res.json();
+                    finalText = data.result || finalText;
+                    addLog(`  💡 Đã rút gọn: "${finalText}". Render lại bản rút gọn với 1.45x...`, 'success');
+                    finalBuffer = await runOmnivoiceRaw(finalText, 1.45, activeVoiceId);
+                 } else {
+                    addLog(`  ❌ AI rút gọn lỗi. Render ép ở mức tối đa 1.8x.`, 'error');
+                    finalBuffer = await runOmnivoiceRaw(finalText, 1.8, activeVoiceId);
+                 }
+              } else {
+                 addLog(`  ⚠️ Cần tốc độ ${neededSpeed.toFixed(2)}x (> 1.8x) nhưng AI Rút gọn TẮT. Render tối đa ở mức 1.8x (sẽ bị tràn).`, 'error');
+                 finalBuffer = await runOmnivoiceRaw(finalText, 1.8, activeVoiceId);
+              }
+           }
+        }
+        
+        audioClips[i] = { buffer: finalBuffer as ArrayBuffer, startTime: sub.start };
+        success = true;
+      } catch (err: any) {
+        addLog(`  ⚠️ Lỗi câu ${i + 1} (lần ${attempts}): ${err.message}`, 'error');
+        await sleep(1500);
+      }
+    }
+    setProgress(Math.round(((i + 1) / totalSubs) * 90));
+  }
+
+  const validAudioClips = audioClips.filter(clip => clip !== null) as { buffer: ArrayBuffer; startTime: number }[];
+  addLog('⚙️ Đang ghép các track vào file tổng hợp...', 'warning');
+  const finalBlob = await mergeAudioClips(validAudioClips);
+  const objectUrl = URL.createObjectURL(finalBlob);
+  setResultUrl(objectUrl);
+  setProgress(100);
+
+  const updatedSrtText = generateSrt(processedSubs);
+  const srtBlob = new Blob([updatedSrtText], { type: 'text/plain' });
+  setResultSrtUrl(URL.createObjectURL(srtBlob));
+
+  addLog('🎉 Hoàn thành!', 'success');
+  setIsProcessing(false);
+  setProcessingProvider(null);
+  return;
+}
+// ===== HẾT LUỒNG RIÊNG OMNIVOICE =====
