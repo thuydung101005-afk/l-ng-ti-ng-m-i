@@ -174,12 +174,14 @@ export function useDubbingEngine() {
     // 2. Bỏ dấu ngoặc kép / đơn bao quanh câu
     text = text.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
     
-    // 3. Chuẩn hóa dấu ba chấm (...) hoặc (……) và dấu đa chấm (..) thành 1 dấu chấm duy nhất
-    text = text.replace(/…+/g, '.');
-    text = text.replace(/\.{2,}/g, '.');
+    // 3. Chuẩn hóa dấu ba chấm (...) hoặc (……) và dấu đa chấm (..) thành dấu phẩy (,)
+    text = text.replace(/…+/g, ',');
+    text = text.replace(/\.{2,}/g, ',');
+    text = text.replace(/,\s*,+/g, ',');
+    text = text.replace(/,\s*\./g, '.');
     
-    // 4. Bỏ các ký tự ngắt lửng vô nghĩa ở cuối (phẩy, chấm phẩy, hai chấm, gạch ngang, ngã)
-    text = text.replace(/[,;:\-–—~]+$/, '').trim();
+    // 4. Bỏ các ký tự ngắt lửng vô nghĩa ở cuối (chấm phẩy, hai chấm, gạch ngang, ngã)
+    text = text.replace(/[;:\-–—~]+$/, '').trim();
     
     // 5. Nếu là câu có dấu phẩy: chuyển đúng chữ cái đầu tiên ngay sau dấu phẩy thành chữ thường (ví dụ: ", Cứ" -> ", cứ")
     // Triệt tiêu hoàn toàn hiện tượng rè chữ cái đầu sau dấu phẩy khi AI phát âm
@@ -189,8 +191,11 @@ export function useDubbingEngine() {
     if (/[.!?]$/.test(text)) {
       // Nếu đã kết thúc bằng (. ? !), gom sạch khoảng trắng/dấu thừa trước nó và giữ đúng 1 dấu
       text = text.replace(/[\s\.]*([.!?])$/, '$1');
+    } else if (text.endsWith(',')) {
+      // Nếu kết thúc bằng dấu phẩy (chuyển từ dấu 3 chấm sang), giữ nguyên dấu phẩy để giọng đọc ngắt lửng tự nhiên
+      text = text.replace(/[\s,]*([,])$/, '$1');
     } else if (text.length > 0) {
-      // Nếu câu chưa có dấu kết thúc, chỉ thêm đúng duy nhất 1 dấu chấm
+      // Nếu câu chưa có dấu kết thúc, thêm đúng duy nhất 1 dấu chấm
       text += '.';
     }
     return text;
@@ -726,6 +731,8 @@ if (activeProvider === 'omnivoice') {
             
             // Bỏ ngoặc kép bao quanh nếu AI rút gọn tự ý thêm vào ("...")
             cleanText = cleanText.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
+            // Chuẩn hóa dấu ba chấm (...) hoặc (……) thành dấu phẩy (,)
+            cleanText = cleanText.replace(/…+/g, ',').replace(/\.{2,}/g, ',');
 
             // Đảm bảo file SRT cuối cùng xuất ra khớp 100% với bản âm thanh đã rút gọn
             if (cleanText !== originalClean) {

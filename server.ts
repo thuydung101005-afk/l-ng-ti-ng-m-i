@@ -467,11 +467,15 @@ Câu gốc cần rút gọn:
       if (req.body && typeof req.body.text === 'string') {
         let t = req.body.text.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ').trim();
         t = t.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
-        t = t.replace(/…+/g, '.').replace(/\.{2,}/g, '.');
-        t = t.replace(/[,;:\-–—~]+$/, '').trim();
+        t = t.replace(/…+/g, ',').replace(/\.{2,}/g, ',');
+        t = t.replace(/,\s*,+/g, ',');
+        t = t.replace(/,\s*\./g, '.');
+        t = t.replace(/[;:\-–—~]+$/, '').trim();
         t = t.replace(/,(\s*)([^\s])/g, (_, space, char) => ',' + space + char.toLowerCase());
         if (/[.!?]$/.test(t)) {
           t = t.replace(/[\s\.]*([.!?])$/, '$1');
+        } else if (t.endsWith(',')) {
+          t = t.replace(/[\s,]*([,])$/, '$1');
         } else if (t.length > 0) {
           t += '.';
         }
