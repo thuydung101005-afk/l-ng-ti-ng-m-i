@@ -100,9 +100,9 @@ function ReviewItemCard({ item, onApprove, onRewrite, maxSpeed, isLast }: { key?
     try {
         const newText = await onRewrite(item.index, item.original, item.neededSpeed);
         setText(newText);
-    } catch (e) {
+    } catch (e: any) {
         console.error(e);
-        alert("Lỗi khi gọi AI rút gọn!");
+        alert(e?.message || "Lỗi khi gọi AI rút gọn!");
     }
     setIsRewriting(false);
   };

@@ -623,7 +623,14 @@ if (activeProvider === 'omnivoice') {
                 attempt: 1
             })
         });
-        if (!res.ok) throw new Error("Lỗi gọi Gemini");
+        if (!res.ok) {
+            const errData = await res.json().catch(() => ({}));
+            const msg = String(errData.error || "");
+            if (msg.includes("401") || msg.includes("UNAUTHENTICATED") || msg.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED")) {
+                throw new Error("Key AI không hợp lệ hoặc bị Google từ chối (401)! Lưu ý: Key Gemini bắt buộc phải có dạng 'AIzaSy...', DeepSeek bắt đầu bằng 'sk-...'. Key hiện tại của bạn không phải key Gemini hợp lệ.");
+            }
+            throw new Error(errData.error || `Lỗi gọi Gemini (HTTP ${res.status})`);
+        }
         const data = await res.json();
         return data.result || originalText;
     };
