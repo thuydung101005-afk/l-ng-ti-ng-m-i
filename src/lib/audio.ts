@@ -273,7 +273,7 @@ export async function timeStretchBufferRubberband(buffer: AudioBuffer, playbackR
     const decodedStretched = await audioCtx.decodeAudioData(stretchedArrayBuffer.slice(0));
     
     // 2. trimSilence cắt bỏ khoảng lặng apad + padding thừa, vuốt mượt ranh giới
-    const cleanBuffer = trimSilence(decodedStretched, 0.005, 0.0012, 0.06, 0.02);
+    const cleanBuffer = trimSilence(decodedStretched, 0.005, 0.0012, 0.25, 0.02);
     const cleanBlob = audioBufferToWav(cleanBuffer);
     return await cleanBlob.arrayBuffer();
   } catch (e) {
@@ -328,7 +328,7 @@ export function trimSilence(
   buffer: AudioBuffer, 
   thresh = 0.005, 
   threshEnd = 0.0015,
-  cushionSec = 0.06,
+  cushionSec = 0.25,
   fadeSec = 0.02
 ): AudioBuffer {
   let startOffset = 0;
@@ -376,8 +376,8 @@ export function trimSilence(
   const rawSpeechEnd = Math.min(buffer.length, lastActiveSample + 1);
   const speechLength = rawSpeechEnd - startOffset;
   
-  // Lấy thêm tối đa 60ms âm thanh thực tế sau lastActiveSample nếu buffer gốc còn
-  const tailHoldSamples = Math.floor(sampleRate * 0.06);
+  // Lấy thêm tối đa 150ms âm thanh thực tế sau lastActiveSample nếu buffer gốc còn
+  const tailHoldSamples = Math.floor(sampleRate * 0.15);
   const availableTailSamples = Math.max(0, buffer.length - rawSpeechEnd);
   const tailSamplesToCopy = Math.min(availableTailSamples, tailHoldSamples);
   
