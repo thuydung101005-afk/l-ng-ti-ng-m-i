@@ -776,8 +776,10 @@ if (activeProvider === 'omnivoice') {
                     return await timeStretchBufferRubberband(audioBuf, speed);
                 };
 
-                let actualDuration1x = decoded1x.duration;
-                // neededSpeed giờ đây là tốc độ TỰ NHIÊN so với khung hình
+                // Tính thời lượng tiếng nói thực tế bằng cách TRỪ ĐI khoảng lặng đệm (chống cụt âm) được thêm vào cho hàm tăng tốc
+                const addedSilence = (decoded1x as any).addedSilence || 0;
+                let actualDuration1x = (decoded1x as any).speechDuration || Math.max(0.1, decoded1x.duration - addedSilence);
+                // neededSpeed giờ đây là tốc độ TỰ NHIÊN chuẩn xác so với khung hình (không bị đội lên do khoảng lặng đệm)
                 let neededSpeed = actualDuration1x / effectiveDuration;
                 
                 // NẾU MODEL SINH RA QUÁ DÀI (câu quá dài so với slot) -> ĐẨY VÀO AI REVIEW

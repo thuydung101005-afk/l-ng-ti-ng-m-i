@@ -432,6 +432,9 @@ export function trimSilence(
       }
   }
   
+  (trimmedBuffer as any).speechDuration = speechLength / sampleRate;
+  (trimmedBuffer as any).addedSilence = (totalOutSamples - speechLength) / sampleRate;
+  
   try { ctx.close(); } catch(e) {}
   return trimmedBuffer;
 }
