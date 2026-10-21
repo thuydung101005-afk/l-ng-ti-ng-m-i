@@ -305,19 +305,41 @@ export default function ConfigSidebar({ engine }: { engine: any }) {
 
                     <div className="mt-4 border-t border-blue-100/50 pt-3">
                       <div className="space-y-2">
-                        <label className="text-sm font-semibold text-blue-900 block">Số tiến trình đồng thời (Concurrency)</label>
-                        <div className="flex items-center space-x-2">
+                        <div className="flex items-center justify-between">
+                          <label className="text-sm font-semibold text-blue-900 block">Số luồng xử lý song song (Tối đa 5 luồng)</label>
+                          <span className="text-xs font-mono font-bold text-blue-600 bg-blue-100 px-2 py-0.5 rounded-full">{concurrency} luồng</span>
+                        </div>
+                        <div className="flex items-center gap-2">
                           <input 
                             type="number" 
                             min="1"
-                            max="20"
+                            max="5"
                             value={concurrency}
-                            onChange={(e) => setConcurrency(parseInt(e.target.value) || 1)}
-                            className="w-24 border border-gray-300 rounded-lg px-3 py-1.5 font-mono text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none"
+                            onChange={(e) => setConcurrency(Math.min(5, Math.max(1, parseInt(e.target.value) || 1)))}
+                            className="w-20 border border-gray-300 rounded-lg px-3 py-1.5 font-mono text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 focus:outline-none"
                             disabled={isProcessing}
                           />
-                          <span className="text-xs text-blue-700/80">Số luồng xử lý song song. Tăng lên để render nhanh hơn.</span>
+                          <div className="flex items-center gap-1">
+                            {[1, 2, 3, 4, 5].map((num) => (
+                              <button
+                                key={num}
+                                type="button"
+                                onClick={() => setConcurrency(num)}
+                                disabled={isProcessing}
+                                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all ${
+                                  concurrency === num
+                                    ? 'bg-blue-600 text-white font-bold shadow-sm'
+                                    : 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                                }`}
+                              >
+                                {num}
+                              </button>
+                            ))}
+                          </div>
                         </div>
+                        <span className="text-xs text-blue-700/80 block mt-1">
+                          ⚡ Chạy song song nhiều câu cùng lúc (hỗ trợ phân phối đều cho tối đa 5 server Colab).
+                        </span>
                       </div>
                     </div>
                   </>

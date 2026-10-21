@@ -581,19 +581,9 @@ export function useDubbingEngine() {
         addLog(`✨ Đã gom từ ${subs.length} dòng ngắn thành ${processedSubs.length} đoạn văn dài mượt mà.`, 'success');
       }
 
-  // Mutex để bảo vệ API Local GPU không bị quá tải do gọi song song
-  let omnivoiceMutex = Promise.resolve();
+  // Gọi API Local GPU (bỏ mutex đơn luồng để hỗ trợ tối đa 5 luồng song song)
   async function safeRunOmnivoiceRaw(text: string, speed: number, voiceId: string, targetDuration?: number) {
-      let release: () => void;
-      const p = new Promise<void>(res => release = res);
-      const prevMutex = omnivoiceMutex;
-      omnivoiceMutex = prevMutex.then(() => p);
-      await prevMutex;
-      try {
-          return await runOmnivoiceRaw(text, speed, voiceId, targetDuration);
-      } finally {
-          release!();
-      }
+      return await runOmnivoiceRaw(text, speed, voiceId, targetDuration);
   }
 
   const totalSubs = processedSubs.length;
@@ -604,14 +594,15 @@ export function useDubbingEngine() {
   const applyTimeStretch = (buf: AudioBuffer, ratio: number) => timeStretchBufferRubberband(buf, ratio);
   const hasGeminiKey = geminiApiKeysStr.trim().length > 0;
 
-  // ===== LUỒNG RIÊNG CHO OMNIVOICE =====
+  // ===== LUỒNG RIÊNG CHO OMNIVOICE (HỖ TRỢ ĐA LUỒNG TỐI ĐA 5 LUỒNG) =====
 if (activeProvider === 'omnivoice') {
-    addLog(`Đang chuẩn bị lồng tiếng Local (OmniVoice GPU) với ${totalSubs} câu...`, 'info');
+    const maxWorkers = Math.min(5, Math.max(1, concurrency || 1));
+    addLog(`Đang chuẩn bị lồng tiếng Local (OmniVoice GPU) với ${totalSubs} câu (chạy song song ${maxWorkers} luồng)...`, 'info');
     
     // Khởi tạo hàng đợi
     renderQueueRef.current = Array.from({length: totalSubs}, (_, i) => i);
     setReviewQueueItems([]);
-    let isWorking = false;
+    let activeWorkers = 0;
     let completedCount = 0;
     let isFinished = false;
     let activeGeminiTasks = 0; // ĐẾM SỐ TÁC VỤ AI ĐANG CHẠY NGẦM
@@ -701,219 +692,237 @@ if (activeProvider === 'omnivoice') {
         processNext();
     };
 
-    const processNext = async () => {
-        // Nếu đang bận, đánh dấu cần chạy lại sau khi xong
-        if (isWorking) {
+    // Hàm xử lý độc lập cho từng câu phụ đề
+    const processSentence = async (i: number) => {
+        const sub = processedSubs[i];
+        if (!sub || !sub.text.trim()) {
+            audioClips[i] = null;
             return;
         }
-        if (renderQueueRef.current.length === 0) {
-            checkCompletion();
-            return;
-        }
-        
-        isWorking = true;
-        
-        while (renderQueueRef.current.length > 0) {
-            const i = renderQueueRef.current.shift()!;
-            
-            const sub = processedSubs[i];
-            let cleanText = sub.text.trim().replace(/^-/, '').trim();
-            const originalClean = cleanText;
-            
-            // Lần theo chuỗi các bản rút gọn nếu câu này bị rút gọn nhiều lần
-            let maxDepth = 10;
-            while (approvedRewrites[cleanText] && maxDepth > 0) {
-                cleanText = approvedRewrites[cleanText];
-                maxDepth--;
-            }
-            
-            // Bỏ ngoặc kép bao quanh nếu AI rút gọn tự ý thêm vào ("...")
-            cleanText = cleanText.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
-            // Chuẩn hóa dấu ba chấm: cuối câu chuyển thành dấu chấm (.), ở giữa câu chuyển thành dấu phẩy (,)
-            cleanText = cleanText.replace(/(?:…|\.{2,})\s*$/g, '.');
-            cleanText = cleanText.replace(/(?:…|\.{2,})/g, ', ');
 
-            // Đảm bảo file SRT cuối cùng xuất ra khớp 100% với bản âm thanh đã rút gọn
-            if (cleanText !== originalClean) {
-                sub.text = cleanText;
+        let cleanText = sub.text.trim().replace(/^-/, '').trim();
+        const originalClean = cleanText;
+        
+        // Lần theo chuỗi các bản rút gọn nếu câu này bị rút gọn nhiều lần
+        let maxDepth = 10;
+        while (approvedRewrites[cleanText] && maxDepth > 0) {
+            cleanText = approvedRewrites[cleanText];
+            maxDepth--;
+        }
+        
+        // Bỏ ngoặc kép bao quanh nếu AI rút gọn tự ý thêm vào ("...")
+        cleanText = cleanText.replace(/^["'“”«»]+|["'“”«»]+$/g, '').trim();
+        // Chuẩn hóa dấu ba chấm: cuối câu chuyển thành dấu chấm (.), ở giữa câu chuyển thành dấu phẩy (,)
+        cleanText = cleanText.replace(/(?:…|\.{2,})\s*$/g, '.');
+        cleanText = cleanText.replace(/(?:…|\.{2,})/g, ', ');
+
+        // Đảm bảo file SRT cuối cùng xuất ra khớp 100% với bản âm thanh đã rút gọn
+        if (cleanText !== originalClean) {
+            sub.text = cleanText;
+        }
+        
+        // Chuẩn hóa văn bản gửi cho TTS: gom triệt để các dấu chấm kép/ba chấm và đảm bảo kết thúc bằng đúng 1 dấu duy nhất
+        let ttsCleanText = sanitizeTextForTTS(cleanText);
+        
+        if (!ttsCleanText.replace(/[,.;:!\?]/g, '').trim()) {
+            addLog(`  ⚠️ Bỏ qua câu ${i+1} vì chỉ chứa dấu câu.`, 'warning');
+            audioClips[i] = null;
+            return;
+        }
+        
+        let targetDuration = sub.end - sub.start;
+        let gap = 0;
+        if (i < totalSubs - 1) {
+            let nextValidIdx = i + 1;
+            while (nextValidIdx < totalSubs && !processedSubs[nextValidIdx].text.trim()) {
+                nextValidIdx++;
             }
-            
-            // Chuẩn hóa văn bản gửi cho TTS: gom triệt để các dấu chấm kép/ba chấm và đảm bảo kết thúc bằng đúng 1 dấu duy nhất
-            let ttsCleanText = sanitizeTextForTTS(cleanText);
-            
-            if (!ttsCleanText.replace(/[,.;:!\?]/g, '').trim()) {
-                addLog(`  ⚠️ Bỏ qua câu ${i+1} vì chỉ chứa dấu câu.`, 'warning');
-                audioClips[i] = null;
-                continue;
+            if (nextValidIdx < totalSubs) {
+                const nextValidSub = processedSubs[nextValidIdx];
+                gap = Math.max(0, nextValidSub.start - sub.end);
+                if (sub.start + targetDuration > nextValidSub.start) {
+                    targetDuration = nextValidSub.start - sub.start;
+                    gap = 0;
+                }
             }
+        }
+        if (targetDuration <= 0) targetDuration = 0.1;
+        
+        addLog(`[${i+1}/${totalSubs}] Đang render...`, 'info');
+
+        try {
+            const effectiveDuration = targetDuration + gap;
+            // @ts-ignore
+            const { trimSilence } = await import('../lib/audio');
             
-            let targetDuration = sub.end - sub.start;
-              let gap = 0;
-              if (i < totalSubs - 1) {
-                  let nextValidIdx = i + 1;
-                  while (nextValidIdx < totalSubs && !processedSubs[nextValidIdx].text.trim()) {
-                      nextValidIdx++;
-                  }
-                  if (nextValidIdx < totalSubs) {
-                      const nextValidSub = processedSubs[nextValidIdx];
-                      gap = Math.max(0, nextValidSub.start - sub.end);
-                      if (sub.start + targetDuration > nextValidSub.start) {
-                          targetDuration = nextValidSub.start - sub.start;
-                          gap = 0;
+            // Render ở tốc độ 1.0x chuẩn để đo đạc thời gian gốc xác thực nhất
+            let rawBuffer = await safeRunOmnivoiceRaw(ttsCleanText, 1.0, activeVoiceId);
+            let decoded1x: AudioBuffer = await audioCtx.decodeAudioData(rawBuffer.slice(0));
+            decoded1x = trimSilence(decoded1x);
+
+            // Helper: Ép tốc độ qua FFmpeg atempo (FFmpeg tự flush buffer chuẩn, không cần bơm 2s mồi hay gọt lại)
+            const stretchAndTrim = async (audioBuf: AudioBuffer, speed: number): Promise<ArrayBuffer> => {
+                return await timeStretchBufferRubberband(audioBuf, speed);
+            };
+
+            // Tính thời lượng tiếng nói thực tế bằng cách TRỪ ĐI khoảng lặng đệm (chống cụt âm) được thêm vào cho hàm tăng tốc
+            const addedSilence = (decoded1x as any).addedSilence || 0;
+            let actualDuration1x = (decoded1x as any).speechDuration || Math.max(0.1, decoded1x.duration - addedSilence);
+            // neededSpeed giờ đây là tốc độ TỰ NHIÊN chuẩn xác so với khung hình (không bị đội lên do khoảng lặng đệm)
+            let neededSpeed = actualDuration1x / effectiveDuration;
+            
+            // NẾU MODEL SINH RA QUÁ DÀI (câu quá dài so với slot) -> ĐẨY VÀO AI REVIEW
+            if (neededSpeed > maxAutoFitSpeed && aiRewrite && hasGeminiKey) {
+                
+                let nextValidIdx = i + 1;
+                while (nextValidIdx < totalSubs && !processedSubs[nextValidIdx].text.trim()) nextValidIdx++;
+                
+                const endsWithComma = cleanText.trim().endsWith(',') || cleanText.trim().endsWith(';');
+                const nextSubStart = nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : Infinity;
+                const gapToNext = nextSubStart - sub.end;
+                
+                if (endsWithComma && gapToNext >= 0 && gapToNext <= Math.max(0.2, groupGap)) {
+                     const nextSub = processedSubs[nextValidIdx];
+                     addLog(`  🔄 Auto-Merge: Câu ${i+1} lố tốc độ & có dấu ngắt, tự động gộp với câu ${nextValidIdx+1}!`, 'success');
+                     
+                     let t1 = sub.text.trim();
+                     let t2 = nextSub.text.trim();
+                      const lastCharT1 = t1.slice(-1);
+                      const hasPunct = [',', '.', '!', '?', ';', ':'].includes(lastCharT1);
+                      if (lastCharT1 === ',' || !hasPunct) {
+                        t2 = t2.charAt(0).toLowerCase() + t2.slice(1);
                       }
-                  }
-              }
-              if (targetDuration <= 0) targetDuration = 0.1;
-            
-            addLog(`[${i+1}/${totalSubs}] Đang render...`, 'info');
-
-            try {
-                const effectiveDuration = targetDuration + gap;
-                // @ts-ignore
-                const { trimSilence } = await import('../lib/audio');
+                      sub.text = t1 + (hasPunct ? ' ' : ', ') + t2;
+                     sub.end = nextSub.end;
+                     nextSub.text = "";
+                     nextSub.start = 0;
+                     nextSub.end = 0;
+                     audioClips[nextValidIdx] = null;
+                     
+                     // Loại bỏ câu tiếp theo khỏi hàng đợi vì đã được gộp
+                     renderQueueRef.current = renderQueueRef.current.filter(idx => idx !== nextValidIdx);
+                     renderQueueRef.current.unshift(i);
+                     return;
+                }
                 
-                // Render ở tốc độ 1.0x chuẩn để đo đạc thời gian gốc xác thực nhất
-                let rawBuffer = await safeRunOmnivoiceRaw(ttsCleanText, 1.0, activeVoiceId);
-                let decoded1x: AudioBuffer = await audioCtx.decodeAudioData(rawBuffer.slice(0));
-                decoded1x = trimSilence(decoded1x);
+                if (requireReview) {
+                    let prevText = "";
+                    let nextText = "";
+                    let prevIdx = i - 1;
+                    while (prevIdx >= 0 && !processedSubs[prevIdx].text.trim()) prevIdx--;
+                    if (prevIdx >= 0) prevText = processedSubs[prevIdx].text.trim();
+                    if (nextValidIdx < totalSubs) nextText = processedSubs[nextValidIdx].text.trim();
 
-                // Helper: Ép tốc độ qua FFmpeg atempo (FFmpeg tự flush buffer chuẩn, không cần bơm 2s mồi hay gọt lại)
-                const stretchAndTrim = async (audioBuf: AudioBuffer, speed: number): Promise<ArrayBuffer> => {
-                    return await timeStretchBufferRubberband(audioBuf, speed);
-                };
-
-                // Tính thời lượng tiếng nói thực tế bằng cách TRỪ ĐI khoảng lặng đệm (chống cụt âm) được thêm vào cho hàm tăng tốc
-                const addedSilence = (decoded1x as any).addedSilence || 0;
-                let actualDuration1x = (decoded1x as any).speechDuration || Math.max(0.1, decoded1x.duration - addedSilence);
-                // neededSpeed giờ đây là tốc độ TỰ NHIÊN chuẩn xác so với khung hình (không bị đội lên do khoảng lặng đệm)
-                let neededSpeed = actualDuration1x / effectiveDuration;
-                
-                // NẾU MODEL SINH RA QUÁ DÀI (câu quá dài so với slot) -> ĐẨY VÀO AI REVIEW
-                if (neededSpeed > maxAutoFitSpeed && aiRewrite && hasGeminiKey) {
-                    
-                    let nextValidIdx = i + 1;
-                    while (nextValidIdx < totalSubs && !processedSubs[nextValidIdx].text.trim()) nextValidIdx++;
-                    
-                    const endsWithComma = cleanText.trim().endsWith(',') || cleanText.trim().endsWith(';');
-                    const nextSubStart = nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : Infinity;
-                    const gapToNext = nextSubStart - sub.end;
-                    
-                    if (endsWithComma && gapToNext >= 0 && gapToNext <= Math.max(0.2, groupGap)) {
-                         const nextSub = processedSubs[nextValidIdx];
-                         addLog(`  🔄 Auto-Merge: Câu ${i+1} lố tốc độ & có dấu ngắt, tự động gộp với câu ${nextValidIdx+1}!`, 'success');
-                         
-                         let t1 = sub.text.trim();
-                         let t2 = nextSub.text.trim();
-                          const lastCharT1 = t1.slice(-1);
-                          const hasPunct = [',', '.', '!', '?', ';', ':'].includes(lastCharT1);
-                          if (lastCharT1 === ',' || !hasPunct) {
-                            t2 = t2.charAt(0).toLowerCase() + t2.slice(1);
-                          }
-                          sub.text = t1 + (hasPunct ? ' ' : ', ') + t2;
-                         sub.end = nextSub.end;
-                         nextSub.text = "";
-                         nextSub.start = 0;
-                         nextSub.end = 0;
-                         audioClips[nextValidIdx] = null;
-                         
-                         renderQueueRef.current.unshift(i);
-                         continue;
-                    }
-                    
-                    if (requireReview) {
-                        let prevText = "";
-                        let nextText = "";
-                        let prevIdx = i - 1;
-                        while (prevIdx >= 0 && !processedSubs[prevIdx].text.trim()) prevIdx--;
-                        if (prevIdx >= 0) prevText = processedSubs[prevIdx].text.trim();
-                        if (nextValidIdx < totalSubs) nextText = processedSubs[nextValidIdx].text.trim();
-
-                        setReviewQueueItems(prev => [...prev, {
-                            index: i,
-                            original: cleanText,
-                            shortened: cleanText,
-                            neededSpeed: neededSpeed,
-                            prevText: prevText,
-                            nextText: nextText,
-                            // Timing info
-                            subStart: sub.start,
-                            subEnd: sub.end,
-                            effectiveDuration: effectiveDuration,
-                            actualDuration1x: actualDuration1x,
-                            prevStart: prevIdx >= 0 ? processedSubs[prevIdx].start : undefined,
-                            prevEnd: prevIdx >= 0 ? processedSubs[prevIdx].end : undefined,
-                            nextStart: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : undefined,
-                            nextEnd: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].end : undefined,
-                        }]);
-                        addLog(`  ⚠️ Câu ${i + 1} lố tốc độ (${neededSpeed.toFixed(2)}x). Đẩy xuống khu vực duyệt!`, 'warning');
-                        checkCompletion();
-                        continue;
-                    } else if (!processedIndices.has(i)) {
-                        // Chế độ Auto-Pilot: Tự động rút gọn qua Gemini không cần bấm duyệt thủ công
-                        addLog(`  🤖 Auto-Pilot: Đang gọi AI rút gọn câu ${i + 1} (cần ${neededSpeed.toFixed(2)}x)...`, 'info');
-                        try {
-                            if (handleRewriteRef.current) {
-                                const rewritten = await handleRewriteRef.current(i, cleanText, neededSpeed);
-                                if (rewritten && rewritten.trim() !== cleanText.trim()) {
-                                    const sanitizedRewritten = sanitizeTextForTTS(rewritten.trim());
-                                    addLog(`  ✨ AI đã rút gọn câu ${i + 1}: "${sanitizedRewritten}"`, 'success');
-                                    approvedRewrites[cleanText] = sanitizedRewritten;
-                                    sub.text = sanitizedRewritten;
-                                    processedIndices.add(i);
-                                    renderQueueRef.current.unshift(i);
-                                    continue;
-                                }
+                    setReviewQueueItems(prev => [...prev, {
+                        index: i,
+                        original: cleanText,
+                        shortened: cleanText,
+                        neededSpeed: neededSpeed,
+                        prevText: prevText,
+                        nextText: nextText,
+                        // Timing info
+                        subStart: sub.start,
+                        subEnd: sub.end,
+                        effectiveDuration: effectiveDuration,
+                        actualDuration1x: actualDuration1x,
+                        prevStart: prevIdx >= 0 ? processedSubs[prevIdx].start : undefined,
+                        prevEnd: prevIdx >= 0 ? processedSubs[prevIdx].end : undefined,
+                        nextStart: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : undefined,
+                        nextEnd: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].end : undefined,
+                    }]);
+                    addLog(`  ⚠️ Câu ${i + 1} lố tốc độ (${neededSpeed.toFixed(2)}x). Đẩy xuống khu vực duyệt!`, 'warning');
+                    return;
+                } else if (!processedIndices.has(i)) {
+                    // Chế độ Auto-Pilot: Tự động rút gọn qua Gemini không cần bấm duyệt thủ công
+                    addLog(`  🤖 Auto-Pilot: Đang gọi AI rút gọn câu ${i + 1} (cần ${neededSpeed.toFixed(2)}x)...`, 'info');
+                    try {
+                        if (handleRewriteRef.current) {
+                            const rewritten = await handleRewriteRef.current(i, cleanText, neededSpeed);
+                            if (rewritten && rewritten.trim() !== cleanText.trim()) {
+                                const sanitizedRewritten = sanitizeTextForTTS(rewritten.trim());
+                                addLog(`  ✨ AI đã rút gọn câu ${i + 1}: "${sanitizedRewritten}"`, 'success');
+                                approvedRewrites[cleanText] = sanitizedRewritten;
+                                sub.text = sanitizedRewritten;
+                                processedIndices.add(i);
+                                renderQueueRef.current.unshift(i);
+                                return;
                             }
-                        } catch (err: any) {
-                            addLog(`  ⚠️ Lỗi AI rút gọn câu ${i + 1}: ${err.message}. Tiếp tục xử lý bằng ép tốc độ.`, 'warning');
                         }
+                    } catch (err: any) {
+                        addLog(`  ⚠️ Lỗi AI rút gọn câu ${i + 1}: ${err.message}. Tiếp tục xử lý bằng ép tốc độ.`, 'warning');
                     }
                 }
-                
-                let finalBuffer = await audioBufferToWav(decoded1x).arrayBuffer();
-                
-                if (neededSpeed <= minAutoFitSpeed) {
-                    addLog(`  ✅ Câu ${i + 1}: Thừa thời gian, áp dụng tốc độ Min (${minAutoFitSpeed}x)`, 'info');
-                    if (minAutoFitSpeed !== 1.0) {
-                        if (useRubberBandStretch) {
-                             finalBuffer = await stretchAndTrim(decoded1x, minAutoFitSpeed);
-                        } else {
-                             addLog(`  ⚠️ Đang tắt Rubber Band. Giữ nguyên bản 1.0x gốc!`, 'warning');
-                        }
-                    }
-                } else if (neededSpeed <= maxAutoFitSpeed) {
-                    addLog(`  ✅ Câu ${i + 1}: Thiếu thời gian, ép tốc độ lên (${neededSpeed.toFixed(2)}x)...`, 'info');
-                    if (useRubberBandStretch) {
-                         finalBuffer = await stretchAndTrim(decoded1x, neededSpeed);
-                    } else {
-                         addLog(`  ⚠️ Đang tắt Rubber Band. Giữ nguyên bản 1.0x gốc (âm thanh sẽ lấn sang câu sau!)`, 'warning');
-                    }
-                } else {
-                    // Safety-net: câu đã được user duyệt (processedIndices) nhưng vẫn lố → ép Max.
-                    // Câu chưa duyệt đã bị đẩy review queue ở trên và 'continue' rồi, không rơi vào đây.
-                    addLog(`  ⚠️ Câu ${i + 1}: Vẫn lố (${neededSpeed.toFixed(2)}x) sau khi duyệt, ép Max (${maxAutoFitSpeed}x).`, 'warning');
-                    if (useRubberBandStretch) {
-                         finalBuffer = await stretchAndTrim(decoded1x, maxAutoFitSpeed);
-                    }
-                }
-                
-                audioClips[i] = { buffer: finalBuffer, startTime: sub.start, maxDuration: sub.end + gap };
-                completedCount++;
-                setProgress(Math.round((completedCount / totalSubs) * 90));
-                
-            } catch (e: any) {
-                addLog(`  ❌ Lỗi render câu ${i+1}: ${e.message}`, 'error');
             }
+            
+            let finalBuffer = await audioBufferToWav(decoded1x).arrayBuffer();
+            
+            if (neededSpeed <= minAutoFitSpeed) {
+                addLog(`  ✅ Câu ${i + 1}: Thừa thời gian, áp dụng tốc độ Min (${minAutoFitSpeed}x)`, 'info');
+                if (minAutoFitSpeed !== 1.0) {
+                    if (useRubberBandStretch) {
+                         finalBuffer = await stretchAndTrim(decoded1x, minAutoFitSpeed);
+                    } else {
+                         addLog(`  ⚠️ Đang tắt Rubber Band. Giữ nguyên bản 1.0x gốc!`, 'warning');
+                    }
+                }
+            } else if (neededSpeed <= maxAutoFitSpeed) {
+                addLog(`  ✅ Câu ${i + 1}: Thiếu thời gian, ép tốc độ lên (${neededSpeed.toFixed(2)}x)...`, 'info');
+                if (useRubberBandStretch) {
+                     finalBuffer = await stretchAndTrim(decoded1x, neededSpeed);
+                } else {
+                     addLog(`  ⚠️ Đang tắt Rubber Band. Giữ nguyên bản 1.0x gốc (âm thanh sẽ lấn sang câu sau!)`, 'warning');
+                }
+            } else {
+                // Safety-net: câu đã được user duyệt (processedIndices) nhưng vẫn lố → ép Max.
+                addLog(`  ⚠️ Câu ${i + 1}: Vẫn lố (${neededSpeed.toFixed(2)}x) sau khi duyệt, ép Max (${maxAutoFitSpeed}x).`, 'warning');
+                if (useRubberBandStretch) {
+                     finalBuffer = await stretchAndTrim(decoded1x, maxAutoFitSpeed);
+                }
+            }
+            
+            audioClips[i] = { buffer: finalBuffer, startTime: sub.start, maxDuration: sub.end + gap };
+            completedCount++;
+            setProgress(Math.round((completedCount / totalSubs) * 90));
+            
+        } catch (e: any) {
+            addLog(`  ❌ Lỗi render câu ${i+1}: ${e.message}`, 'error');
         }
-        
-        isWorking = false;
-        checkCompletion();
+    };
+
+    // Hàm điều phối worker pool song song (tối đa 5 luồng)
+    const processNext = () => {
+        if (renderQueueRef.current.length === 0) {
+            if (activeWorkers === 0) {
+                checkCompletion();
+            }
+            return;
+        }
+
+        while (activeWorkers < maxWorkers && renderQueueRef.current.length > 0) {
+            const nextIdx = renderQueueRef.current.shift()!;
+            activeWorkers++;
+
+            (async (idx: number) => {
+                try {
+                    await processSentence(idx);
+                } catch (err: any) {
+                    addLog(`  ❌ Lỗi xử lý câu ${idx + 1}: ${err.message}`, 'error');
+                } finally {
+                    activeWorkers--;
+                    if (renderQueueRef.current.length > 0) {
+                        processNext();
+                    } else if (activeWorkers === 0) {
+                        checkCompletion();
+                    }
+                }
+            })(nextIdx);
+        }
     };
 
     const checkCompletion = async () => {
-        // Để hoàn thành: Hàng đợi rỗng + Không có việc gì đang làm + Bảng duyệt rỗng + Không có tác vụ AI ngầm
+        // Để hoàn thành: Hàng đợi rỗng + Không còn worker nào đang chạy + Bảng duyệt rỗng + Không có tác vụ AI ngầm
         setReviewQueueItems(prev => {
-            if (renderQueueRef.current.length === 0 && !isWorking && activeGeminiTasks === 0) {
+            if (renderQueueRef.current.length === 0 && activeWorkers === 0 && activeGeminiTasks === 0) {
                 if (prev.length === 0) {
                     if (!isFinished) {
                         isFinished = true;

@@ -13,7 +13,7 @@ let globalGeminiKeyIndex = 0;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: "50mb" }));
   app.use(express.raw({ type: 'audio/wav', limit: '50mb' }));
@@ -446,23 +446,66 @@ Câu gốc cần rút gọn:
     }
   });
 
+  // Quản lý bể Server OmniVoice (hỗ trợ tối đa 5 server Colab song song)
+  const activeOmniRequests: Record<string, number> = {};
+
+  function getOmniVoiceUrls(): string[] {
+    let urls: string[] = [];
+    try {
+      const envPath = path.resolve(process.cwd(), '.env');
+      if (fs.existsSync(envPath)) {
+        const envContent = fs.readFileSync(envPath, 'utf8');
+        
+        // 1. Kiểm tra OMNIVOICE_URL_1 đến OMNIVOICE_URL_5
+        for (let i = 1; i <= 5; i++) {
+          const re = new RegExp(`^OMNIVOICE_URL_${i}\\s*=\\s*(.+)`, 'm');
+          const m = envContent.match(re);
+          if (m && m[1]) {
+            const u = m[1].trim().replace(/^["']|["']$/g, '');
+            if (u && !urls.includes(u)) urls.push(u);
+          }
+        }
+
+        // 2. Kiểm tra OMNIVOICE_URLS hoặc OMNIVOICE_URL (phân tách bởi dấu phẩy hoặc xuống dòng)
+        const matchAll = envContent.match(/^OMNIVOICE_URLS?\s*=\s*(.+)$/m);
+        if (matchAll && matchAll[1]) {
+          const parts = matchAll[1].split(/[,\n;]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+          for (const p of parts) {
+            if (!urls.includes(p)) urls.push(p);
+          }
+        }
+      }
+    } catch (e) {}
+
+    if (urls.length === 0 && process.env.OMNIVOICE_URL) {
+      const parts = process.env.OMNIVOICE_URL.split(/[,\n;]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
+      for (const p of parts) {
+        if (!urls.includes(p)) urls.push(p);
+      }
+    }
+
+    if (urls.length === 0) {
+      urls = ['http://localhost:8001'];
+    }
+
+    // Giới hạn tối đa 5 server và chuẩn hóa URL
+    return urls.slice(0, 5).map(u => u.replace(/\/+$/, ''));
+  }
+
+  app.get('/api/omnivoice/servers', async (req, res) => {
+    const urls = getOmniVoiceUrls();
+    res.json({
+      count: urls.length,
+      servers: urls.map(u => ({
+        url: u,
+        activeRequests: activeOmniRequests[u] || 0
+      }))
+    });
+  });
+
   app.post('/api/omnivoice/generate', async (req, res) => {
     try {
       const { text, voice_id, speed, target_duration, postprocess_output } = req.body;
-
-      // Đọc URL linh hoạt từ .env (tự động cập nhật không cần khởi động lại server)
-      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
-      try {
-        const envPath = path.resolve(process.cwd(), '.env');
-        if (fs.existsSync(envPath)) {
-          const envContent = fs.readFileSync(envPath, 'utf8');
-          const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
-          if (match && match[1]?.trim()) {
-            omniBase = match[1].trim().replace(/^["']|["']$/g, '');
-          }
-        }
-      } catch (e) {}
-      omniBase = omniBase.replace(/\/+$/, '');
 
       if (req.body && typeof req.body.text === 'string') {
         let t = req.body.text.replace(/[\u200B-\u200D\uFEFF\u00A0]/g, ' ').trim();
@@ -482,23 +525,53 @@ Câu gốc cần rút gọn:
         req.body.text = t;
       }
 
-      console.log(`[OmniVoice] Gửi text đến: ${omniBase}/generate | "${req.body?.text}"`);
-      const response = await fetch(`${omniBase}/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(req.body)
-      });
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        return res.status(response.status).json({ error: `OmniVoice error: ${errorText}` });
+      const urls = getOmniVoiceUrls();
+      // Sắp xếp các server theo số request đang chạy (Least Connections - ưu tiên server rảnh nhất)
+      const sortedUrls = [...urls].sort((a, b) => (activeOmniRequests[a] || 0) - (activeOmniRequests[b] || 0));
+
+      let lastError: any = null;
+      let successBuffer: ArrayBuffer | null = null;
+
+      for (const targetUrl of sortedUrls) {
+        activeOmniRequests[targetUrl] = (activeOmniRequests[targetUrl] || 0) + 1;
+        const currentActive = activeOmniRequests[targetUrl];
+        console.log(`[OmniVoice Pool] [Server ${targetUrl}] (Đang chạy: ${currentActive}) | Gửi câu: "${req.body?.text?.substring(0, 30)}..."`);
+
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout
+
+          const response = await fetch(`${targetUrl}/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(req.body),
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errorText}`);
+          }
+
+          successBuffer = await response.arrayBuffer();
+          activeOmniRequests[targetUrl] = Math.max(0, (activeOmniRequests[targetUrl] || 1) - 1);
+          break; // Thành công, thoát vòng lặp
+        } catch (err: any) {
+          activeOmniRequests[targetUrl] = Math.max(0, (activeOmniRequests[targetUrl] || 1) - 1);
+          lastError = err;
+          console.warn(`[OmniVoice Pool] ⚠️ Server ${targetUrl} gặp lỗi: ${err.message}. Thử server tiếp theo nếu có...`);
+        }
       }
-      
-      const arrayBuffer = await response.arrayBuffer();
-      res.setHeader("Content-Type", "audio/wav");
-      res.send(Buffer.from(arrayBuffer));
+
+      if (successBuffer) {
+        res.setHeader("Content-Type", "audio/wav");
+        return res.send(Buffer.from(successBuffer));
+      }
+
+      console.error("[OmniVoice Pool] Tất cả các server đều không phản hồi:", lastError);
+      return res.status(500).json({ error: `Tất cả server OmniVoice đều gặp sự cố: ${lastError?.message || 'Không rõ lỗi'}` });
+
     } catch (error: any) {
       console.error("[OmniVoice] Error:", error);
       res.status(500).json({ error: String(error) });
@@ -506,39 +579,33 @@ Câu gốc cần rút gọn:
   });
 
   app.get('/api/omnivoice/voices', async (req, res) => {
-    try {
-      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
-      const envPath = path.resolve(process.cwd(), '.env');
-      if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf8');
-        const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
-        if (match && match[1]?.trim()) omniBase = match[1].trim().replace(/^["']|["']$/g, '');
-      }
-      omniBase = omniBase.replace(/\/+$/, '');
-      const response = await fetch(`${omniBase}/voices`);
-      const data = await response.json();
-      res.json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: String(error) });
+    const urls = getOmniVoiceUrls();
+    for (const url of urls) {
+      try {
+        const response = await fetch(`${url}/voices`, { signal: AbortSignal.timeout(5000) });
+        if (response.ok) {
+          const data = await response.json();
+          return res.json(data);
+        }
+      } catch (e) {}
     }
+    res.status(500).json({ error: "Không thể lấy danh sách giọng từ bất kỳ server OmniVoice nào." });
   });
 
   app.get('/api/omnivoice/health', async (req, res) => {
-    try {
-      let omniBase = process.env.OMNIVOICE_URL || 'http://localhost:8001';
-      const envPath = path.resolve(process.cwd(), '.env');
-      if (fs.existsSync(envPath)) {
-        const envContent = fs.readFileSync(envPath, 'utf8');
-        const match = envContent.match(/^OMNIVOICE_URL\s*=\s*(.+)$/m);
-        if (match && match[1]?.trim()) omniBase = match[1].trim().replace(/^["']|["']$/g, '');
-      }
-      omniBase = omniBase.replace(/\/+$/, '');
-      const response = await fetch(`${omniBase}/health`);
-      const data = await response.json();
-      res.json(data);
-    } catch (error: any) {
-      res.status(500).json({ error: String(error) });
-    }
+    const urls = getOmniVoiceUrls();
+    const results = await Promise.all(
+      urls.map(async (url) => {
+        try {
+          const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(4000) });
+          const data = await resp.json().catch(() => ({}));
+          return { url, online: resp.ok, activeRequests: activeOmniRequests[url] || 0, data };
+        } catch (e: any) {
+          return { url, online: false, activeRequests: activeOmniRequests[url] || 0, error: e.message };
+        }
+      })
+    );
+    res.json({ count: urls.length, servers: results });
   });
 
   // Proxy the audio file download to avoid CORS issues
