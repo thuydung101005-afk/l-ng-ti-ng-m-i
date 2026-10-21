@@ -663,8 +663,6 @@ if (activeProvider === 'omnivoice') {
         // Clear all absorbed subs
         for (let idx = finalStartIndex + 1; idx <= finalEndIndex; idx++) {
             processedSubs[idx].text = "";
-            processedSubs[idx].start = 0;
-            processedSubs[idx].end = 0;
             audioClips[idx] = null;
             processedIndices.add(idx);
             
@@ -758,6 +756,14 @@ if (activeProvider === 'omnivoice') {
             
             // Render ở tốc độ 1.0x chuẩn để đo đạc thời gian gốc xác thực nhất
             let rawBuffer = await safeRunOmnivoiceRaw(ttsCleanText, 1.0, activeVoiceId);
+            
+            // KIỂM TRA QUAN TRỌNG: Nếu trong lúc chờ tạo audio 1.0x, câu này đã bị câu trước gộp (auto-merge):
+            if (!processedSubs[i].text.trim()) {
+                addLog(`  ℹ️ Câu ${i + 1} đã được tự động gộp vào câu trước. Hủy bỏ tác vụ riêng lẻ!`, 'info');
+                audioClips[i] = null;
+                return;
+            }
+
             let decoded1x: AudioBuffer = await audioCtx.decodeAudioData(rawBuffer.slice(0));
             decoded1x = trimSilence(decoded1x);
 
@@ -798,10 +804,17 @@ if (activeProvider === 'omnivoice') {
                      nextSub.text = ""; // Đánh dấu đã gộp nội dung vào câu trước, giữ nguyên mốc thời gian
                      audioClips[nextValidIdx] = null;
                      
-                     // Loại bỏ câu tiếp theo khỏi hàng đợi vì đã được gộp
+                     // Loại bỏ câu tiếp theo khỏi cả hàng đợi render và bảng duyệt (nếu lỡ bị đẩy vào)
                      renderQueueRef.current = renderQueueRef.current.filter(idx => idx !== nextValidIdx);
+                     setReviewQueueItems(prev => prev.filter(item => item.index !== nextValidIdx));
                      renderQueueRef.current.unshift(i);
                      return;
+                }
+                
+                // Tuyệt đối không đẩy vào bảng duyệt nếu câu đã bị gộp
+                if (!processedSubs[i].text.trim()) {
+                    audioClips[i] = null;
+                    return;
                 }
                 
                 if (requireReview) {
