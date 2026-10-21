@@ -458,7 +458,7 @@ Câu gốc cần rút gọn:
         
         // 1. Kiểm tra OMNIVOICE_URL_1 đến OMNIVOICE_URL_5
         for (let i = 1; i <= 5; i++) {
-          const re = new RegExp(`^OMNIVOICE_URL_${i}\\s*=\\s*(.+)`, 'm');
+          const re = new RegExp(`^\\s*OMNIVOICE_URL_${i}\\s*=\\s*(.+)`, 'm');
           const m = envContent.match(re);
           if (m && m[1]) {
             const u = m[1].trim().replace(/^["']|["']$/g, '');
@@ -467,7 +467,7 @@ Câu gốc cần rút gọn:
         }
 
         // 2. Kiểm tra OMNIVOICE_URLS hoặc OMNIVOICE_URL (phân tách bởi dấu phẩy hoặc xuống dòng)
-        const matchAll = envContent.match(/^OMNIVOICE_URLS?\s*=\s*(.+)$/m);
+        const matchAll = envContent.match(/^\s*OMNIVOICE_URLS?\s*=\s*(.+)$/m);
         if (matchAll && matchAll[1]) {
           const parts = matchAll[1].split(/[,\n;]+/).map(s => s.trim().replace(/^["']|["']$/g, '')).filter(Boolean);
           for (const p of parts) {

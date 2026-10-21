@@ -603,6 +603,7 @@ if (activeProvider === 'omnivoice') {
     renderQueueRef.current = Array.from({length: totalSubs}, (_, i) => i);
     setReviewQueueItems([]);
     let activeWorkers = 0;
+    const activeIndices = new Set<number>(); // Khóa an toàn: đảm bảo các câu liền kề không bao giờ chạy đè lên nhau
     let completedCount = 0;
     let isFinished = false;
     let activeGeminiTasks = 0; // ĐẾM SỐ TÁC VỤ AI ĐANG CHẠY NGẦM
@@ -794,9 +795,7 @@ if (activeProvider === 'omnivoice') {
                       }
                       sub.text = t1 + (hasPunct ? ' ' : ', ') + t2;
                      sub.end = nextSub.end;
-                     nextSub.text = "";
-                     nextSub.start = 0;
-                     nextSub.end = 0;
+                     nextSub.text = ""; // Đánh dấu đã gộp nội dung vào câu trước, giữ nguyên mốc thời gian
                      audioClips[nextValidIdx] = null;
                      
                      // Loại bỏ câu tiếp theo khỏi hàng đợi vì đã được gộp
@@ -830,7 +829,7 @@ if (activeProvider === 'omnivoice') {
                         nextStart: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : undefined,
                         nextEnd: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].end : undefined,
                     }]);
-                    addLog(`  ⚠️ Câu ${i + 1} lố tốc độ (${neededSpeed.toFixed(2)}x). Đẩy xuống khu vực duyệt!`, 'warning');
+                    addLog(`  ⚠️ Câu ${i + 1} lố tốc độ (${neededSpeed.toFixed(2)}x | Giọng đọc ${actualDuration1x.toFixed(2)}s / Khung ${(sub.end - sub.start).toFixed(2)}s + gap ${gap.toFixed(2)}s). Đẩy xuống khu vực duyệt!`, 'warning');
                     return;
                 } else if (!processedIndices.has(i)) {
                     // Chế độ Auto-Pilot: Tự động rút gọn qua Gemini không cần bấm duyệt thủ công
@@ -899,7 +898,19 @@ if (activeProvider === 'omnivoice') {
         }
 
         while (activeWorkers < maxWorkers && renderQueueRef.current.length > 0) {
-            const nextIdx = renderQueueRef.current.shift()!;
+            // An toàn đa luồng: Tuyệt đối không cho 2 câu liền kề (idx và idx±1) chạy cùng lúc
+            // để tránh race condition khi câu trước mượn gap hoặc tự động gộp (auto-merge) với câu sau!
+            const candidateQueueIdx = renderQueueRef.current.findIndex(idx => {
+                return !activeIndices.has(idx - 1) && !activeIndices.has(idx + 1);
+            });
+
+            if (candidateQueueIdx === -1) {
+                // Các câu còn lại đều đang kề cạnh các câu đang chạy, tạm dừng chờ worker hiện tại trả khóa
+                break;
+            }
+
+            const nextIdx = renderQueueRef.current.splice(candidateQueueIdx, 1)[0];
+            activeIndices.add(nextIdx);
             activeWorkers++;
 
             (async (idx: number) => {
@@ -908,6 +919,7 @@ if (activeProvider === 'omnivoice') {
                 } catch (err: any) {
                     addLog(`  ❌ Lỗi xử lý câu ${idx + 1}: ${err.message}`, 'error');
                 } finally {
+                    activeIndices.delete(idx);
                     activeWorkers--;
                     if (renderQueueRef.current.length > 0) {
                         processNext();
