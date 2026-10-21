@@ -779,8 +779,8 @@ if (activeProvider === 'omnivoice') {
             // neededSpeed giờ đây là tốc độ TỰ NHIÊN chuẩn xác so với khung hình (không bị đội lên do khoảng lặng đệm)
             let neededSpeed = actualDuration1x / effectiveDuration;
             
-            // NẾU MODEL SINH RA QUÁ DÀI (câu quá dài so với slot) -> ĐẨY VÀO AI REVIEW (chỉ khi câu chưa được duyệt)
-            if (neededSpeed > maxAutoFitSpeed && aiRewrite && hasGeminiKey && !processedIndices.has(i)) {
+            // NẾU CÂU LỐ TỐC ĐỘ TRẦN (neededSpeed > maxAutoFitSpeed)
+            if (neededSpeed > maxAutoFitSpeed && (requireReview || (aiRewrite && hasGeminiKey))) {
                 
                 let nextValidIdx = i + 1;
                 while (nextValidIdx < totalSubs && !processedSubs[nextValidIdx].text.trim()) nextValidIdx++;
@@ -789,7 +789,8 @@ if (activeProvider === 'omnivoice') {
                 const nextSubStart = nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : Infinity;
                 const gapToNext = nextSubStart - sub.end;
                 
-                if (endsWithComma && gapToNext >= 0 && gapToNext <= Math.max(0.2, groupGap)) {
+                // Tự động gộp nếu kết thúc bằng dấu phẩy và gap nhỏ (chỉ áp dụng ở lượt đầu, chưa qua duyệt thủ công)
+                if (!processedIndices.has(i) && endsWithComma && gapToNext >= 0 && gapToNext <= Math.max(0.2, groupGap)) {
                      const nextSub = processedSubs[nextValidIdx];
                      addLog(`  🔄 Auto-Merge: Câu ${i+1} lố tốc độ & có dấu ngắt, tự động gộp với câu ${nextValidIdx+1}!`, 'success');
                      
@@ -818,7 +819,9 @@ if (activeProvider === 'omnivoice') {
                     return;
                 }
                 
-                if (requireReview && !processedIndices.has(i)) {
+                // Chế độ Kiểm Duyệt: Bất kể câu mới hay câu đã duyệt qua, nếu thời gian VẪN KHÔNG ĐỦ -> Đẩy vào bảng duyệt cho người dùng duyệt lại!
+                if (requireReview) {
+                    processedIndices.delete(i); // Đánh dấu chưa xong để người dùng kiểm duyệt
                     let prevText = "";
                     let nextText = "";
                     let prevIdx = i - 1;
@@ -826,23 +829,27 @@ if (activeProvider === 'omnivoice') {
                     if (prevIdx >= 0) prevText = processedSubs[prevIdx].text.trim();
                     if (nextValidIdx < totalSubs) nextText = processedSubs[nextValidIdx].text.trim();
 
-                    setReviewQueueItems(prev => [...prev, {
-                        index: i,
-                        original: cleanText,
-                        shortened: cleanText,
-                        neededSpeed: neededSpeed,
-                        prevText: prevText,
-                        nextText: nextText,
-                        // Timing info
-                        subStart: sub.start,
-                        subEnd: sub.end,
-                        effectiveDuration: effectiveDuration,
-                        actualDuration1x: actualDuration1x,
-                        prevStart: prevIdx >= 0 ? processedSubs[prevIdx].start : undefined,
-                        prevEnd: prevIdx >= 0 ? processedSubs[prevIdx].end : undefined,
-                        nextStart: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : undefined,
-                        nextEnd: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].end : undefined,
-                    }]);
+                    setReviewQueueItems(prev => {
+                        const filtered = prev.filter(item => item.index !== i);
+                        const newItem = {
+                            index: i,
+                            original: sub.text.trim(),
+                            shortened: sub.text.trim(),
+                            neededSpeed: neededSpeed,
+                            prevText: prevText,
+                            nextText: nextText,
+                            // Timing info
+                            subStart: sub.start,
+                            subEnd: sub.end,
+                            effectiveDuration: effectiveDuration,
+                            actualDuration1x: actualDuration1x,
+                            prevStart: prevIdx >= 0 ? processedSubs[prevIdx].start : undefined,
+                            prevEnd: prevIdx >= 0 ? processedSubs[prevIdx].end : undefined,
+                            nextStart: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].start : undefined,
+                            nextEnd: nextValidIdx < totalSubs ? processedSubs[nextValidIdx].end : undefined,
+                        };
+                        return [...filtered, newItem].sort((a, b) => a.index - b.index);
+                    });
                     addLog(`  ⚠️ Câu ${i + 1} lố tốc độ (${neededSpeed.toFixed(2)}x | Giọng đọc ${actualDuration1x.toFixed(2)}s / Khung ${(sub.end - sub.start).toFixed(2)}s + gap ${gap.toFixed(2)}s). Đẩy xuống khu vực duyệt!`, 'warning');
                     return;
                 } else if (!processedIndices.has(i)) {
@@ -886,8 +893,8 @@ if (activeProvider === 'omnivoice') {
                      addLog(`  ⚠️ Đang tắt Rubber Band. Giữ nguyên bản 1.0x gốc (âm thanh sẽ lấn sang câu sau!)`, 'warning');
                 }
             } else {
-                // Safety-net: câu đã được user duyệt (processedIndices) nhưng vẫn lố → ép Max.
-                addLog(`  ⚠️ Câu ${i + 1}: Vẫn lố (${neededSpeed.toFixed(2)}x) sau khi duyệt, ép Max (${maxAutoFitSpeed}x).`, 'warning');
+                // Safety-net: chỉ xảy ra ở chế độ Auto-Pilot (hoặc khi tắt kiểm duyệt)
+                addLog(`  ⚠️ Câu ${i + 1}: Vượt ngưỡng trần (${neededSpeed.toFixed(2)}x), ép tốc độ Max (${maxAutoFitSpeed}x).`, 'warning');
                 if (useRubberBandStretch) {
                      finalBuffer = await stretchAndTrim(decoded1x, maxAutoFitSpeed);
                 }
@@ -965,24 +972,6 @@ if (activeProvider === 'omnivoice') {
     };
 
     const finishDubbing = async () => {
-        // Tấm lưới an toàn tuyệt đối: Đảm bảo không bao giờ có bất kỳ câu nào bị bỏ rơi / câm tiếng trong file xuất ra!
-        for (let idx = 0; idx < totalSubs; idx++) {
-            if (processedSubs[idx] && processedSubs[idx].text.trim() && audioClips[idx] === null) {
-                addLog(`  ⚡ Đang tự động tạo bù âm thanh cho câu ${idx + 1} ở tốc độ trần ${maxAutoFitSpeed}x...`, 'warning');
-                try {
-                    const cleanT = sanitizeTextForTTS(processedSubs[idx].text);
-                    const raw = await safeRunOmnivoiceRaw(cleanT, 1.0, activeVoiceId);
-                    const dec = await audioCtx.decodeAudioData(raw.slice(0));
-                    const { trimSilence } = await import('../lib/audio');
-                    const trimmed = trimSilence(dec);
-                    const stretched = await timeStretchBufferRubberband(trimmed, maxAutoFitSpeed);
-                    audioClips[idx] = { buffer: stretched, startTime: processedSubs[idx].start };
-                } catch (e: any) {
-                    addLog(`  ❌ Lỗi tạo bù cho câu ${idx + 1}: ${e.message}`, 'error');
-                }
-            }
-        }
-
         const validAudioClips = audioClips.filter((clip, idx) => clip !== null && processedSubs[idx] && processedSubs[idx].text.trim() !== "") as { buffer: ArrayBuffer; startTime: number }[];
         addLog('✨ Đang ghép các track vào file tổng hợp...', 'warning');
         const finalBlob = await mergeAudioClips(validAudioClips);

@@ -54,7 +54,7 @@ export default function ReviewPanel({ items, onApprove, onRewrite, maxSpeed, tot
       </div>
       
       <div className="p-4 space-y-4 max-h-[500px] overflow-y-auto">
-        {items.map((item) => (
+        {[...items].sort((a, b) => a.index - b.index).map((item) => (
           <ReviewItemCard key={item.index} item={item} onApprove={onApprove} onRewrite={onRewrite} maxSpeed={maxSpeed} isLast={item.index >= totalSubs - 1} />
         ))}
       </div>
